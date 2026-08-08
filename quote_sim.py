@@ -43,10 +43,11 @@ import requests
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-ASSETS = ["btc", "eth"]
+ASSETS = ["btc"]                  # one asset — sized for a $50 wallet
 TIMEFRAME_SEC = 900              # 900 = 15m markets, 300 = 5m
 TARGET_PAIR = 0.97               # quote so Up + Down costs this much
-SHARES = 100.0                   # shares quoted per side
+SHARES = 25.0                    # ~$24 per pair, fits $50 with headroom
+SKEW_LIMIT = 0.25                # skip markets outside 25/75 - see run_market()
 QUOTE_AFTER_SEC = 30             # wait this long after open before quoting
 STOP_QUOTING_SEC = 90            # stop quoting this long before expiry
 SETTLE_CHECK_SEC = 20            # read the winner this long before expiry
@@ -164,14 +165,29 @@ def run_market(m: Market, s: requests.Session):
         log.info("[%s] no book — skip", m.asset)
         return
 
-    # Split TARGET_PAIR proportionally to where the market thinks fair is.
     mid_up = (ub + ua) / 2 if ub else ua
     mid_dn = (db + da) / 2 if db else da
     tot = mid_up + mid_dn
     if tot <= 0:
         return
-    q_up = round(TARGET_PAIR * (mid_up / tot), 2)
-    q_dn = round(TARGET_PAIR * (mid_dn / tot), 2)
+    fair_up, fair_dn = mid_up / tot, mid_dn / tot
+
+    # Skip lopsided markets. Quoting a 7c token isn't market making, it's
+    # buying a longshot — and the cheap side fills precisely because it's
+    # dying. That's adverse selection, not edge.
+    if not (SKEW_LIMIT <= fair_up <= 1 - SKEW_LIMIT):
+        log.info("[%s] skewed %.0f/%.0f — skip", m.asset,
+                 fair_up * 100, fair_dn * 100)
+        log_row(ts_utc=datetime.now(timezone.utc).isoformat(), asset=m.asset,
+                slug=m.slug, filled="SKIP", note=f"skew {fair_up:.2f}")
+        return
+
+    # Take the edge EQUALLY in absolute cents from each side. Splitting it
+    # proportionally means the cheap side is barely improved on fair, so it
+    # fills far too easily while the expensive side never does.
+    half = (1.0 - TARGET_PAIR) / 2
+    q_up = round(fair_up - half, 2)
+    q_dn = round(fair_dn - half, 2)
     if q_up < 0.01 or q_dn < 0.01:
         log.info("[%s] degenerate quote — skip", m.asset)
         return
@@ -199,8 +215,13 @@ def run_market(m: Market, s: requests.Session):
     # settle: whichever side is trading near $1 late in the window is the winner
     while m.left() > SETTLE_CHECK_SEC and not _shutdown:
         time.sleep(0.5)
-    ub, _ = book(m.up_token, s)
-    db, _ = book(m.down_token, s)
+    ub = db = None
+    for _ in range(6):                      # retry - one empty read isn't fatal
+        ub, _x = book(m.up_token, s)
+        db, _y = book(m.down_token, s)
+        if ub is not None and db is not None:
+            break
+        time.sleep(1.5)
     if ub is None or db is None:
         winner, note = "?", "no settle book"
     elif ub > db:
@@ -210,16 +231,21 @@ def run_market(m: Market, s: requests.Session):
 
     pair = q_up + q_dn
     if up_filled and dn_filled:
+        # hedged — the outcome is irrelevant, so this scores either way
         pnl = SHARES * (1.0 - pair)
         filled, note = "BOTH", "riskless"
+    elif not up_filled and not dn_filled:
+        pnl, filled = 0.0, "NONE"
+    elif winner == "?":
+        # BUG FIX: a naked position we couldn't settle is UNKNOWN, not a loss.
+        # Scoring it 0 silently biased every result negative.
+        pnl, filled, note = 0.0, "UNSCORED", "no settle book — excluded"
     elif up_filled:
         pnl = SHARES * ((1.0 if winner == "Up" else 0.0) - q_up)
         filled = "UP_ONLY"
-    elif dn_filled:
+    else:
         pnl = SHARES * ((1.0 if winner == "Down" else 0.0) - q_dn)
         filled = "DOWN_ONLY"
-    else:
-        pnl, filled = 0.0, "NONE"
 
     icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
     log.info("[%s] %s %s | winner %s | %+.2f USD", m.asset, icon, filled, winner, pnl)
