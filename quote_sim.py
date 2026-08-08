@@ -47,6 +47,7 @@ ASSETS = ["btc"]                  # one asset — sized for a $50 wallet
 TIMEFRAME_SEC = 900              # 900 = 15m markets, 300 = 5m
 TARGET_PAIR = 0.97               # quote so Up + Down costs this much
 SHARES = 25.0                    # ~$24 per pair, fits $50 with headroom
+STARTING_CAPITAL = 50.0          # your real bankroll — the sim respects it
 SKEW_LIMIT = 0.25                # skip markets outside 25/75 - see run_market()
 QUOTE_AFTER_SEC = 30             # wait this long after open before quoting
 STOP_QUOTING_SEC = 90            # stop quoting this long before expiry
@@ -141,7 +142,48 @@ def book(token: str, s: requests.Session):
 # ─────────────────────────────────────────────────────────────────────────────
 
 CSV_COLS = ["ts_utc", "asset", "slug", "quote_up", "quote_down", "pair_cost",
-            "filled", "winner", "pnl_usd", "note"]
+            "filled", "winner", "pnl_usd", "bankroll", "note"]
+
+
+class Ledger:
+    """Running bankroll + the fill-rate stats that decide everything."""
+
+    def __init__(self, start: float):
+        self.start = start
+        self.cash = start
+        self.peak = start
+        self.stats = {}
+        self.lock = threading.Lock()
+
+    def can_afford(self, cost: float) -> bool:
+        with self.lock:
+            return self.cash >= cost
+
+    def record(self, outcome: str, pnl: float) -> float:
+        with self.lock:
+            self.cash += pnl
+            self.peak = max(self.peak, self.cash)
+            self.stats[outcome] = self.stats.get(outcome, 0) + 1
+            return self.cash
+
+    def line(self) -> str:
+        with self.lock:
+            pnl = self.cash - self.start
+            pct = pnl / self.start * 100 if self.start else 0
+            dd = (self.cash - self.peak) / self.peak * 100 if self.peak else 0
+            both = self.stats.get("BOTH", 0)
+            one = self.stats.get("UP_ONLY", 0) + self.stats.get("DOWN_ONLY", 0)
+            traded = both + one
+            rate = both / traded * 100 if traded else 0.0
+            bits = " · ".join(f"{k} {v}" for k, v in sorted(self.stats.items()))
+            return (f"\n  💰 BANKROLL ${self.cash:.2f}  ({pnl:+.2f}, {pct:+.1f}%)"
+                    f"   peak ${self.peak:.2f}  drawdown {dd:.1f}%\n"
+                    f"  📊 {bits}\n"
+                    f"  🎯 TWO-SIDED FILL RATE: {rate:.1f}%  ({both}/{traded})"
+                    f"   ← the wallet you found runs ~89%\n")
+
+
+LEDGER = Ledger(STARTING_CAPITAL)
 
 
 def log_row(**kw):
@@ -192,8 +234,16 @@ def run_market(m: Market, s: requests.Session):
         log.info("[%s] degenerate quote — skip", m.asset)
         return
 
-    log.info("[%s] quoting Up $%.2f / Down $%.2f  (pair $%.2f)",
-             m.asset, q_up, q_dn, q_up + q_dn)
+    need = (q_up + q_dn) * SHARES
+    if not LEDGER.can_afford(need):
+        log.warning("[%s] need $%.2f, bankroll $%.2f — cannot quote",
+                    m.asset, need, LEDGER.cash)
+        log_row(ts_utc=datetime.now(timezone.utc).isoformat(), asset=m.asset,
+                slug=m.slug, filled="NO_CAPITAL", bankroll=f"{LEDGER.cash:.2f}")
+        return
+
+    log.info("[%s] quoting Up $%.2f / Down $%.2f  (pair $%.2f, risking $%.2f)",
+             m.asset, q_up, q_dn, q_up + q_dn, need)
 
     up_filled = dn_filled = False
 
@@ -248,12 +298,14 @@ def run_market(m: Market, s: requests.Session):
         filled = "DOWN_ONLY"
 
     icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
+    bankroll = LEDGER.record(filled, pnl)
     log.info("[%s] %s %s | winner %s | %+.2f USD", m.asset, icon, filled, winner, pnl)
+    log.info(LEDGER.line())
 
     log_row(ts_utc=datetime.now(timezone.utc).isoformat(), asset=m.asset,
             slug=m.slug, quote_up=f"{q_up:.2f}", quote_down=f"{q_dn:.2f}",
             pair_cost=f"{pair:.4f}", filled=filled, winner=winner,
-            pnl_usd=f"{pnl:.4f}", note=note)
+            pnl_usd=f"{pnl:.4f}", bankroll=f"{bankroll:.2f}", note=note)
 
 
 def worker(asset: str):
