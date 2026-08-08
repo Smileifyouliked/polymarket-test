@@ -1,0 +1,22 @@
+# ─────────────────────────────────────────────────────────────
+# SECRETS — never commit these. Bots scrape public GitHub for
+# private keys within SECONDS of a push and drain the wallet.
+# This file is the only thing standing between you and that.
+# ─────────────────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+secrets.json
+credentials*
+
+# logs and results (regenerate on the box, don't version them)
+*.csv
+*.log
+nohup.out
+
+# python
+venv/
+__pycache__/
+*.pyc
+.Python
