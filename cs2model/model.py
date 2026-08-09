@@ -82,6 +82,13 @@ def build_features(
     observed this match — that ordering is enforced by the caller.
     """
     a, b = match.team_a, match.team_b
+
+    # Register the lineups BEFORE reading any rating. The five names are known
+    # before the game starts, so a roster change must widen uncertainty for
+    # this match — not for the one after it.
+    book.apply_lineup(a, match.lineup_a)
+    book.apply_lineup(b, match.lineup_b)
+
     sa, sb = book.team(a), book.team(b)
 
     # Compute the seven map probabilities once, then let the veto simulator
@@ -328,8 +335,14 @@ def decide(probs: np.ndarray, threshold: float) -> np.ndarray:
 
     The no-call is a feature. A model that must answer every match is a model
     that is wrong about a third of them.
+
+    `threshold` is a CONFIDENCE, so it is clamped at 0.5 — below that the two
+    bands overlap and every call is simultaneously "A" and "B". The previous
+    version assigned both masks unconditionally and let the second overwrite
+    the first, so decide([0.55, 0.59], 0.45) confidently returned "team B"
+    twice. Nothing in the codebase passes a sub-0.5 threshold today, but
+    coverage_curve() accepts arbitrary ones, so a sweep starting at 0.4 would
+    have silently inverted every call it made.
     """
-    out = np.zeros(len(probs), dtype=int)
-    out[probs >= threshold] = 1
-    out[probs <= 1 - threshold] = -1
-    return out
+    t = max(float(threshold), 0.5)
+    return np.where(probs >= t, 1, np.where(probs <= 1.0 - t, -1, 0)).astype(int)

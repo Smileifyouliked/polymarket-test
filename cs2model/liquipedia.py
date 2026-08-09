@@ -27,18 +27,34 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import requests
 
 from .data import ACTIVE_DUTY, Match, MapResult
 
-BASE = "https://api.liquipedia.net/api/v3"
+# The auth header format is confirmed: "Authorization: Apikey <key>".
+#
+# The base URL path is NOT confirmed — sources disagree between
+# api.liquipedia.net/api/v3 and api.liquipedia.net/v3, and the host is
+# unreachable from the machine this was written on. Rather than hard-code a
+# coin flip and hand you a 404 to debug, we probe the candidates once and
+# remember whichever answers. Set LIQUIPEDIA_API_BASE to skip the probing.
+BASE_CANDIDATES: Tuple[str, ...] = tuple(
+    b for b in (
+        os.getenv("LIQUIPEDIA_API_BASE"),
+        "https://api.liquipedia.net/api/v3",
+        "https://api.liquipedia.net/v3",
+    ) if b
+)
+
 USER_AGENT = os.getenv(
     "LIQUIPEDIA_USER_AGENT",
     "cs2model/0.1 (research; set LIQUIPEDIA_USER_AGENT to your contact info)",
 )
 SLEEP_SECONDS = 2.2  # their documented floor is 2s. Stay above it.
+
+_resolved_base: Optional[str] = None
 
 
 class LiquipediaError(RuntimeError):
@@ -57,6 +73,44 @@ def _session() -> requests.Session:
     return s
 
 
+def resolve_base(
+    session: Optional[requests.Session] = None,
+    datapoint: str = "match",
+    wiki: str = "counterstrike",
+) -> str:
+    """
+    Find the working API base URL, once per process.
+
+    A 401/403 counts as SUCCESS for this purpose: it means the path is right
+    and only the key is being rejected. Only 404/405 mean "wrong path". That
+    distinction is what makes the error message below useful instead of
+    telling you to fix your key when the URL was the problem.
+    """
+    global _resolved_base
+    if _resolved_base:
+        return _resolved_base
+
+    s = session or _session()
+    tried: List[str] = []
+    for base in BASE_CANDIDATES:
+        try:
+            r = s.get(f"{base}/{datapoint}", params={"wiki": wiki, "limit": 1}, timeout=30)
+        except requests.RequestException as e:
+            tried.append(f"  {base} -> network error: {e}")
+            continue
+        if r.status_code in (200, 401, 403):
+            _resolved_base = base
+            return base
+        tried.append(f"  {base} -> HTTP {r.status_code}: {r.text[:150]}")
+
+    raise LiquipediaError(
+        "Could not find a working Liquipedia API base URL. Tried:\n"
+        + "\n".join(tried)
+        + "\n\nIf you know the correct one, set it directly:\n"
+        "  export LIQUIPEDIA_API_BASE=https://.../v3"
+    )
+
+
 def fetch_raw(
     datapoint: str = "match",
     wiki: str = "counterstrike",
@@ -67,12 +121,23 @@ def fetch_raw(
 ) -> List[dict]:
     """One page of raw records, exactly as the API returns them."""
     s = session or _session()
+    base = resolve_base(s, datapoint=datapoint, wiki=wiki)
     params = {"wiki": wiki, "limit": limit, "offset": offset}
     if conditions:
         params["conditions"] = conditions
-    resp = s.get(f"{BASE}/{datapoint}", params=params, timeout=45)
+    resp = s.get(f"{base}/{datapoint}", params=params, timeout=45)
+    if resp.status_code == 401:
+        raise LiquipediaError(
+            "HTTP 401 — the API rejected your key. Check LIQUIPEDIA_API_KEY is "
+            "set correctly (run: echo $LIQUIPEDIA_API_KEY)."
+        )
+    if resp.status_code == 429:
+        raise LiquipediaError(
+            "HTTP 429 — rate limited. Wait a few minutes; do not lower "
+            "SLEEP_SECONDS."
+        )
     if resp.status_code != 200:
-        raise LiquipediaError(f"HTTP {resp.status_code}: {resp.text[:400]}")
+        raise LiquipediaError(f"HTTP {resp.status_code} from {base}: {resp.text[:400]}")
     payload = resp.json()
     if payload.get("error"):
         raise LiquipediaError(str(payload["error"]))
@@ -122,6 +187,15 @@ def _parse_date(raw) -> Optional[datetime]:
         except ValueError:
             continue
     return None
+
+
+def _as_int(v) -> Optional[int]:
+    """Round scores arrive as ints, numeric strings, '' , '-' or None."""
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
 
 
 def _opponent_name(op: dict) -> str:
@@ -188,11 +262,22 @@ def _to_match(rec: dict) -> Optional[Match]:
             continue
         if gw not in (1, 2):
             continue
+        # Round scores, from the WINNER's point of view.
+        #
+        # The fallbacks used to be written as team 1's score (13) and team 2's
+        # score (0), then swapped when team 2 won — which handed the winner a
+        # 0-13 scoreline whenever the scores were missing or non-numeric. Derive
+        # the pair only when both values are real, and otherwise fall back to a
+        # placeholder that is at least the right way round.
         scores = g.get("scores") or []
-        s1 = int(scores[0]) if len(scores) > 0 and str(scores[0]).isdigit() else 13
-        s2 = int(scores[1]) if len(scores) > 1 and str(scores[1]).isdigit() else 0
+        s1 = _as_int(scores[0]) if len(scores) > 0 else None
+        s2 = _as_int(scores[1]) if len(scores) > 1 else None
+
         w, l = (a, b) if gw == 1 else (b, a)
-        rw, rl = (s1, s2) if gw == 1 else (s2, s1)
+        if s1 is None or s2 is None:
+            rw, rl = 13, 0
+        else:
+            rw, rl = (s1, s2) if gw == 1 else (s2, s1)
         maps.append(
             MapResult(map_name=mname, winner=w, loser=l, rounds_winner=rw, rounds_loser=rl)
         )
@@ -227,7 +312,13 @@ def _to_match(rec: dict) -> Optional[Match]:
 
 
 def _tier_from_liquipedia(rec: dict) -> int:
-    raw = str((rec.get("liquipediatier") or rec.get("extradata", {}).get("liquipediatier") or "")).strip()
+    # `or {}` rather than a .get default: Liquipedia sends extradata as an
+    # explicit null on some records, and dict.get("extradata", {}) returns that
+    # None rather than the default — the AttributeError then killed the whole
+    # rate-limited ingest partway through. Every other read in this file
+    # already used the `or {}` form.
+    extradata = rec.get("extradata") or {}
+    raw = str(rec.get("liquipediatier") or extradata.get("liquipediatier") or "").strip()
     mapping = {"1": 1, "2": 2, "3": 3, "4": 3, "5": 3}
     return mapping.get(raw, 2)
 
