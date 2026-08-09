@@ -55,7 +55,12 @@ def cmd_demo(args) -> int:
 
 
 def cmd_explore(args) -> int:
-    from .liquipedia import fetch_raw
+    from .liquipedia import fetch_raw, resolve_base
+
+    base = resolve_base(datapoint=args.datapoint)
+    print(f"API base URL that answered: {base}")
+    print("  (if this differs from the default, export LIQUIPEDIA_API_BASE="
+          f"{base} to skip probing next time)\n")
 
     rows = fetch_raw(datapoint=args.datapoint, limit=args.limit)
     print(f"{len(rows)} raw records. Top-level keys of the first:\n")
