@@ -16,6 +16,7 @@ import json
 import os
 import random
 import sys
+import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -161,6 +162,117 @@ def cmd_predict(args) -> int:
     return 0
 
 
+def cmd_bet(args) -> int:
+    from .tracker import Ledger, kelly_fraction
+
+    led = Ledger(args.ledger, starting_capital=args.capital)
+    if not led.positions and args.capital > 0:
+        led.starting_capital = args.capital
+
+    stake = args.stake
+    if stake is None:
+        # No stake given: suggest capped Kelly rather than making one up.
+        avail = led.stats().capital
+        frac = kelly_fraction(args.prob, args.odds, cap=args.kelly_cap)
+        stake = round(avail * frac, 2)
+        print(f"no --stake given; {args.kelly_cap:.0%} Kelly on {avail:,.2f} "
+              f"suggests {stake:,.2f}")
+        if stake <= 0:
+            print("Kelly says do not take this bet — the edge is negative.",
+                  file=sys.stderr)
+            return 1
+
+    try:
+        p = led.open_position(
+            team_a=args.team_a, team_b=args.team_b, pick=args.pick,
+            model_prob=args.prob, odds=args.odds, stake=stake,
+            best_of=args.bo, event=args.event, note=args.note,
+        )
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    print(f"opened {p.id}: {p.pick} @ {p.odds:.2f} for {p.stake:,.2f} "
+          f"(to win {p.to_win:,.2f}, edge {p.edge:+.1%})")
+    return 0
+
+
+def cmd_settle(args) -> int:
+    from .tracker import Ledger
+
+    led = Ledger(args.ledger)
+    try:
+        p = led.settle(args.id, args.result)
+    except (KeyError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"settled {p.id} as {p.status}: P&L {p.pnl:+,.2f} "
+          f"— capital now {led.stats().capital:,.2f}")
+    return 0
+
+
+def cmd_dashboard(args) -> int:
+    from .dashboard import render, render_compact
+    from .tracker import Heartbeat, Ledger
+
+    hb = Heartbeat(args.heartbeat, stale_after=args.stale_after)
+
+    def once() -> str:
+        led = Ledger(args.ledger, starting_capital=args.capital)
+        return render_compact(led, hb) if args.compact else render(led, hb)
+
+    if not args.watch:
+        print(once())
+        return 0
+
+    try:
+        while True:
+            # Re-read from disk each tick so a running `run` loop or another
+            # SSH session settling a bet shows up here immediately.
+            os.system("clear" if os.name != "nt" else "cls")
+            print(once())
+            print(f"\n  refreshing every {args.watch}s — Ctrl+C to exit")
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_run(args) -> int:
+    """
+    The long-running process. Beats, then does its periodic work.
+
+    Keep it in tmux on a server so it survives your SSH session dropping:
+        tmux new -s cs2
+        python -m cs2model.cli run
+        Ctrl+B then D to detach
+    """
+    from .tracker import Heartbeat, Ledger
+
+    hb = Heartbeat(args.heartbeat, stale_after=max(args.interval * 3, 60))
+    print(f"starting run loop: heartbeat -> {args.heartbeat} every {args.interval}s")
+    print("Ctrl+C to stop")
+
+    try:
+        while True:
+            led = Ledger(args.ledger, starting_capital=args.capital)
+            s = led.stats()
+            note = (f"capital {s.capital:,.2f} · {s.open_count} open · "
+                    f"{s.wins}W-{s.losses}L")
+            hb.beat(status="ok", note=note)
+            print(f"{datetime.now(timezone.utc):%H:%M:%S}  beat · {note}")
+
+            if args.once:
+                return 0
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        hb.beat(status="stopped", note="stopped by operator")
+        print("\nstopped cleanly — heartbeat marked as stopped")
+        return 0
+    except Exception as e:  # keep the loop's death visible in the heartbeat
+        hb.beat(status="crashed", note=f"{type(e).__name__}: {e}")
+        raise
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="cs2model", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -200,6 +312,50 @@ def main(argv=None) -> int:
     p.add_argument("--threshold", type=float, default=0.72,
                    help="below this confidence the model declines to call it")
     p.set_defaults(func=cmd_predict)
+
+    # ── tracking ─────────────────────────────────────────────────────────────
+    def _ledger_args(sp):
+        sp.add_argument("--ledger", default="data/ledger.json")
+        sp.add_argument("--capital", type=float, default=0.0,
+                        help="starting bankroll; only used when creating a new ledger")
+
+    b = sub.add_parser("bet", help="record a position you are taking")
+    _ledger_args(b)
+    b.add_argument("--team-a", required=True)
+    b.add_argument("--team-b", required=True)
+    b.add_argument("--pick", required=True, help="which team you are backing")
+    b.add_argument("--prob", type=float, required=True,
+                   help="model probability for your PICK (0-1)")
+    b.add_argument("--odds", type=float, required=True, help="decimal odds, e.g. 1.85")
+    b.add_argument("--stake", type=float, default=None,
+                   help="omit to get a capped-Kelly suggestion")
+    b.add_argument("--kelly-cap", type=float, default=0.25)
+    b.add_argument("--bo", type=int, default=3, choices=[1, 3, 5])
+    b.add_argument("--event", default="")
+    b.add_argument("--note", default="")
+    b.set_defaults(func=cmd_bet)
+
+    st = sub.add_parser("settle", help="resolve an open position")
+    _ledger_args(st)
+    st.add_argument("--id", required=True)
+    st.add_argument("--result", required=True, choices=["won", "lost", "void"])
+    st.set_defaults(func=cmd_settle)
+
+    db = sub.add_parser("dashboard", help="capital, P&L, open positions, health")
+    _ledger_args(db)
+    db.add_argument("--heartbeat", default="data/heartbeat.json")
+    db.add_argument("--stale-after", type=float, default=180.0)
+    db.add_argument("--watch", type=float, default=0.0,
+                    metavar="SECONDS", help="refresh continuously")
+    db.add_argument("--compact", action="store_true", help="single-line output")
+    db.set_defaults(func=cmd_dashboard)
+
+    rn = sub.add_parser("run", help="long-running loop that emits the heartbeat")
+    _ledger_args(rn)
+    rn.add_argument("--heartbeat", default="data/heartbeat.json")
+    rn.add_argument("--interval", type=float, default=60.0)
+    rn.add_argument("--once", action="store_true", help="single beat then exit")
+    rn.set_defaults(func=cmd_run)
 
     args = ap.parse_args(argv)
     return args.func(args)
