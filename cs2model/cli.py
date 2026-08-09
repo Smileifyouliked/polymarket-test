@@ -58,12 +58,17 @@ def cmd_demo(args) -> int:
 def cmd_explore(args) -> int:
     from .liquipedia import fetch_raw, resolve_base
 
-    base = resolve_base(datapoint=args.datapoint)
+    base = resolve_base(datapoint=args.datapoint, wiki=args.wiki)
     print(f"API base URL that answered: {base}")
     print("  (if this differs from the default, export LIQUIPEDIA_API_BASE="
           f"{base} to skip probing next time)\n")
 
-    rows = fetch_raw(datapoint=args.datapoint, limit=args.limit)
+    rows = fetch_raw(
+        datapoint=args.datapoint,
+        wiki=args.wiki,
+        limit=args.limit,
+        conditions=args.conditions,
+    )
     print(f"{len(rows)} raw records. Top-level keys of the first:\n")
     if rows:
         for k in sorted(rows[0]):
@@ -74,6 +79,13 @@ def cmd_explore(args) -> int:
             print(f"  {k:<28} {preview}")
         print("\nfull first record:\n")
         print(json.dumps(rows[0], indent=2)[:4000])
+
+    if args.save:
+        os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
+        with open(args.save, "w") as f:
+            json.dump(rows, f, indent=2)
+        print(f"\nsaved {len(rows)} raw records -> {args.save}")
+        print("This file contains no credentials — it is safe to share.")
     return 0
 
 
@@ -288,6 +300,13 @@ def main(argv=None) -> int:
     e = sub.add_parser("explore", help="dump raw Liquipedia records")
     e.add_argument("--datapoint", default="match")
     e.add_argument("--limit", type=int, default=3)
+    e.add_argument("--wiki", default="counterstrike")
+    e.add_argument("--conditions", default="",
+                   help="Liquipedia filter, e.g. '[[game::cs2]]' or "
+                        "'[[winner::]]' for unplayed (upcoming) matches")
+    e.add_argument("--save", default="",
+                   help="write the raw records to this file (contains no "
+                        "credentials, safe to share)")
     e.set_defaults(func=cmd_explore)
 
     i = sub.add_parser("ingest", help="fetch matches from Liquipedia")
