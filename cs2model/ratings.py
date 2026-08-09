@@ -15,7 +15,7 @@ import math
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, Optional, Sequence, Tuple
 
 from . import glicko
 from .data import ACTIVE_DUTY, Match
@@ -131,26 +131,64 @@ class RatingBook:
         w, l = self.h2h[key]
         return (w, l) if a < b else (l, w)
 
+    # ── lineup side ──────────────────────────────────────────────────────────
+
+    def apply_lineup(self, tid: str, lineup: Sequence[str]) -> int:
+        """
+        Register the lineup a team is fielding and widen its rating uncertainty
+        if players have changed. Returns how many players changed.
+
+        MUST BE CALLED BEFORE FEATURES, NOT AFTER.
+          A lineup is pre-match information — you can see the five names before
+          the game starts. This used to live inside observe(), which runs after
+          build_features(), so the very first match with a new roster was still
+          forecast using the old five players' rating at full confidence. That
+          is precisely the case the whole mechanism exists to handle, and it
+          was the one case it missed.
+
+        PARTIAL LINEUPS ARE IGNORED.
+          Liquipedia does not always report all five players. Taking a 3-name
+          record at face value made it look like a two-player swap, which
+          regressed the rating hard and inflated RD for no reason — and nothing
+          ever undoes that. A report with fewer than five names tells us
+          nothing, so we keep the last known good lineup instead.
+
+        Idempotent: calling it twice with the same lineup does nothing the
+        second time, so observe() can call it safely too.
+        """
+        if not lineup or len(lineup) < 5:
+            return 0
+
+        st = self.teams[tid]
+        new = tuple(lineup)
+        if not st.lineup:
+            st.lineup = new
+            return 0
+        if len(st.lineup) < 5 or set(st.lineup) == set(new):
+            st.lineup = new
+            return 0
+
+        changed = len(set(st.lineup) - set(new))
+        st.lineup = new
+        if changed:
+            st.overall = glicko.inflate_for_roster_change(st.overall, changed)
+            for m in list(st.per_map):
+                st.per_map[m] = glicko.inflate_for_roster_change(st.per_map[m], changed)
+        return changed
+
     # ── write side ───────────────────────────────────────────────────────────
 
     def observe(self, match: Match) -> None:
         """Fold a completed match into the book. Call AFTER extracting features."""
         a, b = match.team_a, match.team_b
-        sa, sb = self.teams[a], self.teams[b]
 
-        # Roster churn: widen uncertainty before learning anything new.
-        for tid, lineup in ((a, match.lineup_a), (b, match.lineup_b)):
-            st = self.teams[tid]
-            if lineup and st.lineup:
-                changed = len(set(st.lineup) - set(lineup))
-                if changed:
-                    st.overall = glicko.inflate_for_roster_change(st.overall, changed)
-                    for m in list(st.per_map):
-                        st.per_map[m] = glicko.inflate_for_roster_change(
-                            st.per_map[m], changed
-                        )
-            if lineup:
-                st.lineup = tuple(lineup)
+        # No-ops when build_features already applied these (the normal path);
+        # does the work when observe() is driven directly, as when rebuilding
+        # the book from history before a prediction.
+        self.apply_lineup(a, match.lineup_a)
+        self.apply_lineup(b, match.lineup_b)
+
+        sa, sb = self.teams[a], self.teams[b]
 
         # Learn map by map. This is where the per-map identity comes from.
         for mr in match.maps:
@@ -162,13 +200,21 @@ class RatingBook:
             sa.map_games[mr.map_name] += 1
             sb.map_games[mr.map_name] += 1
 
-            # Overall rating learns from maps too, at reduced weight — a map is
-            # less evidence than a series.
-            oa, ob = sa.overall.copy(), sb.overall.copy()
-            sa.overall = glicko.update(oa, ob, 1.0 if wa else 0.0)
-            sb.overall = glicko.update(ob, oa, 0.0 if wa else 1.0)
-
         a_won = match.winner == a
+
+        # The overall rating updates ONCE, on the series result.
+        #
+        # It used to update inside the map loop, at full Glicko weight, so a
+        # Bo3 moved it three times and `overall.games` counted maps while
+        # calling itself matches. That made RD shrink far too fast — the
+        # ratings, the rd_sum feature and the glicko baseline were all
+        # systematically over-confident. A series is one piece of evidence
+        # about who is better; the per-map ratings above are where map-level
+        # detail belongs.
+        oa, ob = sa.overall.copy(), sb.overall.copy()
+        sa.overall = glicko.update(oa, ob, 1.0 if a_won else 0.0)
+        sb.overall = glicko.update(ob, oa, 0.0 if a_won else 1.0)
+
         for tid, won in ((a, a_won), (b, not a_won)):
             st = self.teams[tid]
             st.recent.append(1 if won else 0)

@@ -189,6 +189,15 @@ def _parse_date(raw) -> Optional[datetime]:
     return None
 
 
+def _as_int(v) -> Optional[int]:
+    """Round scores arrive as ints, numeric strings, '' , '-' or None."""
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
 def _opponent_name(op: dict) -> str:
     for k in ("name", "template", "opponentname", "id"):
         v = op.get(k)
@@ -253,11 +262,22 @@ def _to_match(rec: dict) -> Optional[Match]:
             continue
         if gw not in (1, 2):
             continue
+        # Round scores, from the WINNER's point of view.
+        #
+        # The fallbacks used to be written as team 1's score (13) and team 2's
+        # score (0), then swapped when team 2 won — which handed the winner a
+        # 0-13 scoreline whenever the scores were missing or non-numeric. Derive
+        # the pair only when both values are real, and otherwise fall back to a
+        # placeholder that is at least the right way round.
         scores = g.get("scores") or []
-        s1 = int(scores[0]) if len(scores) > 0 and str(scores[0]).isdigit() else 13
-        s2 = int(scores[1]) if len(scores) > 1 and str(scores[1]).isdigit() else 0
+        s1 = _as_int(scores[0]) if len(scores) > 0 else None
+        s2 = _as_int(scores[1]) if len(scores) > 1 else None
+
         w, l = (a, b) if gw == 1 else (b, a)
-        rw, rl = (s1, s2) if gw == 1 else (s2, s1)
+        if s1 is None or s2 is None:
+            rw, rl = 13, 0
+        else:
+            rw, rl = (s1, s2) if gw == 1 else (s2, s1)
         maps.append(
             MapResult(map_name=mname, winner=w, loser=l, rounds_winner=rw, rounds_loser=rl)
         )
@@ -292,7 +312,13 @@ def _to_match(rec: dict) -> Optional[Match]:
 
 
 def _tier_from_liquipedia(rec: dict) -> int:
-    raw = str((rec.get("liquipediatier") or rec.get("extradata", {}).get("liquipediatier") or "")).strip()
+    # `or {}` rather than a .get default: Liquipedia sends extradata as an
+    # explicit null on some records, and dict.get("extradata", {}) returns that
+    # None rather than the default — the AttributeError then killed the whole
+    # rate-limited ingest partway through. Every other read in this file
+    # already used the `or {}` form.
+    extradata = rec.get("extradata") or {}
+    raw = str(rec.get("liquipediatier") or extradata.get("liquipediatier") or "").strip()
     mapping = {"1": 1, "2": 2, "3": 3, "4": 3, "5": 3}
     return mapping.get(raw, 2)
 

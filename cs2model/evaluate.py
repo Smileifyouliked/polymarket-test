@@ -196,6 +196,19 @@ def walk_forward(
             markets.extend(m.closing_prob_a for m in ds.matches[s:e])
         folds += 1
 
+    if folds == 0:
+        # Every candidate fold failed the `e - s < 5 or s < 100` guard, and
+        # np.concatenate([]) then died with "need at least one array to
+        # concatenate" — a traceback that says nothing about the real problem,
+        # which is simply not enough matches yet.
+        raise ValueError(
+            f"Not enough data to evaluate: {n} usable matches produced no valid "
+            f"folds (need >100 for the first training window, and >=5 matches "
+            f"per fold at initial_frac={initial_frac}, n_folds={n_folds}).\n"
+            f"Ingest more matches — try --pages 40 or higher — or lower "
+            f"--initial-frac to start testing earlier in the history."
+        )
+
     return WalkForwardResult(
         y=np.concatenate(ys),
         p_model=np.concatenate(pm),

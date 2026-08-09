@@ -16,6 +16,7 @@ import pytest
 from cs2model import glicko
 from cs2model.data import (
     ACTIVE_DUTY,
+    Match,
     generate_synthetic_league,
     series_prob,
 )
@@ -286,3 +287,125 @@ def test_decide_abstains_in_the_middle():
     p = np.array([0.10, 0.45, 0.50, 0.55, 0.90])
     calls = decide(p, 0.75)
     assert list(calls) == [-1, 0, 0, 0, 1]
+
+
+# ── regressions from the code review ─────────────────────────────────────────
+#
+# Every test below reproduces a bug that shipped and passed the original suite.
+
+
+def test_walk_forward_explains_itself_when_there_is_too_little_data():
+    """Used to die with 'need at least one array to concatenate'."""
+    matches = generate_synthetic_league(n_teams=8, n_matches=100, seed=3)
+    ds = build_dataset(matches)
+    with pytest.raises(ValueError, match="Not enough data"):
+        walk_forward(ds, initial_frac=0.5, n_folds=8)
+
+
+def test_decide_never_inverts_below_half():
+    """
+    decide([0.55, 0.59], 0.45) used to return [-1, -1]: both masks were
+    assigned unconditionally and the second overwrote the first.
+    """
+    p = np.array([0.55, 0.59, 0.40])
+    calls = decide(p, 0.45)
+    assert list(calls) == [1, 1, -1]
+    # And a 0.5 threshold means "call everything", not "call everything for B".
+    assert list(decide(np.array([0.6, 0.4]), 0.5)) == [1, -1]
+
+
+def test_overall_rating_counts_matches_not_maps():
+    """
+    The overall rating updated once per MAP at full Glicko weight, so a Bo3
+    moved it three times and RD collapsed far too fast.
+    """
+    matches = [m for m in generate_synthetic_league(n_teams=6, n_matches=60, seed=4)
+               if m.winner and m.maps]
+    book = RatingBook()
+    played = 0
+    tid = matches[0].team_a
+    for m in matches:
+        book.observe(m)
+        if tid in (m.team_a, m.team_b):
+            played += 1
+    assert book.team(tid).overall.games == played
+
+
+def test_roster_change_affects_the_very_match_it_appears_in():
+    """
+    Roster inflation lived in observe(), which runs AFTER build_features, so
+    the first match with a new lineup was still forecast at full confidence
+    using the departed players' rating.
+    """
+    matches = [m for m in generate_synthetic_league(n_teams=8, n_matches=200, seed=6)
+               if m.winner and m.maps]
+    book = RatingBook()
+    for m in matches[:150]:
+        book.observe(m)
+
+    nxt = matches[150]
+    before = book.team(nxt.team_a).overall.rd
+    swapped = Match(
+        team_a=nxt.team_a, team_b=nxt.team_b, date=nxt.date, best_of=3,
+        lineup_a=("new1", "new2", "new3", "new4", "new5"),
+        lineup_b=book.team(nxt.team_b).lineup,
+    )
+    build_features(book, swapped)
+    assert book.team(nxt.team_a).overall.rd > before, (
+        "a brand-new five should make the model LESS sure before this match, "
+        "not after it"
+    )
+
+
+def test_partial_lineup_does_not_look_like_a_roster_swap():
+    """
+    Liquipedia does not always report five players. A 3-name record used to
+    read as a two-player swap and permanently regressed the rating.
+    """
+    book = RatingBook()
+    five = ("a", "b", "c", "d", "e")
+    book.apply_lineup("T", five)
+    book.team("T").overall = glicko.Rating(r=1850, rd=55)
+
+    assert book.apply_lineup("T", ("a", "b", "c")) == 0
+    assert book.team("T").overall.rd == 55
+    assert book.team("T").overall.r == 1850
+    assert book.team("T").lineup == five, "keep the last known good five"
+
+    # A real, fully-reported swap still registers.
+    assert book.apply_lineup("T", ("a", "b", "c", "d", "z")) == 1
+    assert book.team("T").overall.rd > 55
+
+
+def test_liquipedia_tier_survives_null_extradata():
+    """dict.get('extradata', {}) returns None when the key holds an explicit
+    null, and .get on that raised AttributeError mid-ingest."""
+    from cs2model.liquipedia import _tier_from_liquipedia
+
+    assert _tier_from_liquipedia({"extradata": None}) == 2
+    assert _tier_from_liquipedia({"extradata": None, "liquipediatier": "1"}) == 1
+    assert _tier_from_liquipedia({"extradata": {"liquipediatier": "3"}}) == 3
+
+
+def test_missing_scores_do_not_give_the_winner_zero_rounds():
+    """The 13/0 fallback was written from team 1's view, so a team-2 win with
+    missing scores produced rounds_winner=0, rounds_loser=13."""
+    from cs2model.liquipedia import _to_match
+
+    rec = {
+        "match2opponents": [{"name": "Alpha"}, {"name": "Bravo"}],
+        "winner": "2",
+        "date": "2025-01-01 12:00:00",
+        "bestof": "1",
+        "match2games": [{"map": "de_mirage", "winner": "2", "scores": []}],
+    }
+    m = _to_match(rec)
+    assert m is not None
+    assert m.winner == "Bravo"
+    assert m.maps[0].winner == "Bravo"
+    assert m.maps[0].rounds_winner > m.maps[0].rounds_loser
+
+    # Real scores are still honoured, and still from the winner's side.
+    rec["match2games"] = [{"map": "de_nuke", "winner": "2", "scores": ["7", "13"]}]
+    m2 = _to_match(rec)
+    assert (m2.maps[0].rounds_winner, m2.maps[0].rounds_loser) == (13, 7)
