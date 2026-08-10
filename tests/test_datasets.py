@@ -161,3 +161,36 @@ def test_hltv_map_results_go_to_the_right_team(tmp_path):
 def test_hltv_best_of_comes_from_the_series_score(tmp_path):
     ms = load_csv_matches(_write(tmp_path, "h.csv", HLTV), verbose=False)
     assert all(m.best_of == 3 for m in ms)
+
+
+def test_winner_comes_from_the_score_not_the_label(tmp_path):
+    """
+    The winner column holds a team name in one dataset, a side label in the
+    next, an index in a third. The score needs no interpretation, so it wins.
+    """
+    csv = HLTV.replace(",Vitality,2,1,", ",team1,2,1,").replace(",NAVI,0,2,", ",GARBAGE,0,2,")
+    ms = load_csv_matches(_write(tmp_path, "w.csv", csv), verbose=False)
+    assert len(ms) == 3
+    assert ms[0].winner == "Vitality"
+    assert [m for m in ms if m.team_a == "FaZe"][0].winner == "NAVI"
+
+
+def test_winner_label_forms_are_understood():
+    from cs2model.datasets import _match_winner_name
+
+    assert _match_winner_name("team1", "A", "B") == "A"
+    assert _match_winner_name("Team 2", "A", "B") == "B"
+    assert _match_winner_name("  vitality ", "Vitality", "Spirit") == "Vitality"
+    assert _match_winner_name("junk", "A", "B") is None
+    assert _match_winner_name("", "A", "B") is None
+
+
+def test_failures_report_the_offending_values(tmp_path):
+    """
+    An error that hides the data forces a round trip to learn something the
+    code already had. Every skip reason carries examples, not just dates.
+    """
+    bad = "date,winner,score_team1,score_team2,team1_name,team2_name\nNOT_A_DATE,???,1,1,A,B\n"
+    with pytest.raises(ValueError) as e:
+        load_csv_matches(_write(tmp_path, "b.csv", bad), verbose=False)
+    assert "NOT_A_DATE" in str(e.value)

@@ -110,6 +110,32 @@ def _load_match_level(
 _HLTV_REQUIRED = ("team1_name", "team2_name", "winner", "date")
 
 
+def _match_winner_name(raw: str, a: str, b: str) -> Optional[str]:
+    """
+    Work out which team a winner field refers to.
+
+    Datasets encode this as a team name, a side label, an index, or a flag,
+    with inconsistent case and spacing, so compare loosely rather than
+    demanding an exact string match.
+    """
+    v = str(raw).strip().lower()
+    if not v:
+        return None
+    if v in ("1", "team1", "team 1", "t1", "a", "team_1", "first"):
+        return a
+    if v in ("2", "team2", "team 2", "t2", "b", "team_2", "second"):
+        return b
+
+    def norm(x):
+        return " ".join(str(x).lower().split())
+
+    if v == norm(a):
+        return a
+    if v == norm(b):
+        return b
+    return None
+
+
 def _load_hltv_wide(path, headers, rows, verbose=True, set_pool=True) -> List[Match]:
     """
     The HLTV-scrape shape: one row per MATCH, wide, with player names.
@@ -137,35 +163,45 @@ def _load_hltv_wide(path, headers, rows, verbose=True, set_pool=True) -> List[Ma
     matches: List[Match] = []
     skipped = Counter()
     seen_maps = Counter()
-    bad_dates: List[str] = []
+    # Examples per skip reason. The date fix only recorded examples for dates,
+    # so the very next failure — the winner column — was just as blind. Record
+    # them for every reason instead of learning this one column at a time.
+    examples: Dict[str, List[str]] = defaultdict(list)
+
+    def skip(reason: str, value: str = "") -> None:
+        skipped[reason] += 1
+        if value and len(examples[reason]) < 5:
+            examples[reason].append(value)
 
     for r in rows:
         d = _parse_date(col("date", r), dayfirst=False)
         if d is None:
-            skipped["unparseable date"] += 1
-            if len(bad_dates) < 5:
-                bad_dates.append(col("date", r))
+            skip("unparseable date", col("date", r))
             continue
 
         a, b = col("team1_name", r), col("team2_name", r)
         if not a or not b or a == b:
-            skipped["missing or identical teams"] += 1
+            skip("missing or identical teams", f"{a!r} vs {b!r}")
             continue
-
-        raw_winner = col("winner", r)
-        if raw_winner == a or raw_winner == "1":
-            winner = a
-        elif raw_winner == b or raw_winner == "2":
-            winner = b
-        else:
-            skipped["unrecognised winner"] += 1
-            continue
-        loser = b if winner == a else a
 
         try:
             s1, s2 = int(col("score_team1", r, "0")), int(col("score_team2", r, "0"))
         except ValueError:
             s1 = s2 = 0
+
+        # Prefer the SCORE. It is unambiguous, whereas the winner column can
+        # hold a team name, a side label ("team1"), a flag, or an index, and
+        # every dataset picks differently. The score needs no interpretation.
+        if s1 != s2:
+            winner = a if s1 > s2 else b
+        else:
+            winner = _match_winner_name(col("winner", r), a, b)
+            if winner is None:
+                skip("cannot determine winner", 
+                     f"winner={col('winner', r)!r} score={s1}-{s2}")
+                continue
+
+        loser = b if winner == a else a
         top = max(s1, s2)
         best_of = 1 if top <= 1 else (3 if top == 2 else 5)
 
@@ -217,9 +253,8 @@ def _load_hltv_wide(path, headers, rows, verbose=True, set_pool=True) -> List[Ma
         # Show what was actually in the file. An error that hides the offending
         # value forces a round trip to find out something the code already knew.
         detail = f"no usable rows in {path}; skipped: {dict(skipped)}"
-        if bad_dates:
-            detail += f"\n  example date values that would not parse: {bad_dates}"
-            detail += "\n  supported: ISO, d/m/y, m/d/y, textual months, unix timestamps"
+        for reason, vals in examples.items():
+            detail += f"\n  {reason} — examples: {vals}"
         raise ValueError(detail)
 
     matches.sort(key=lambda m: m.date)
