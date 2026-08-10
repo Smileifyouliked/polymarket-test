@@ -27,7 +27,7 @@ import numpy as np
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 
-from .data import Match
+from .data import Match, has_map_detail
 from .ratings import RatingBook
 from .veto import match_win_prob
 
@@ -91,11 +91,21 @@ def build_features(
 
     sa, sb = book.team(a), book.team(b)
 
-    # Compute the seven map probabilities once, then let the veto simulator
-    # hammer a dict instead of re-deriving Glicko expectations thousands of
-    # times per fixture.
-    table = book.map_prob_table(a, b, match.date)
-    veto_p = match_win_prob(table.__getitem__, match.best_of, n_sims=n_sims, seed=seed)
+    # Compute the map probabilities once, then let the veto simulator hammer a
+    # dict instead of re-deriving Glicko expectations thousands of times per
+    # fixture.
+    if has_map_detail():
+        table = book.map_prob_table(a, b, match.date)
+        veto_p = match_win_prob(table.__getitem__, match.best_of, n_sims=n_sims,
+                                seed=seed)
+    else:
+        # The dataset never said which maps were played, so there is no veto to
+        # simulate. Fall back to the overall rating rather than inventing a map
+        # pool — a fabricated veto would produce a confident number backed by
+        # nothing.
+        from . import glicko as _g
+
+        veto_p = _g.expected_score(sa.overall, sb.overall)
 
     h2h_w, h2h_l = book.h2h_record(a, b)
     h2h = 0.0 if (h2h_w + h2h_l) == 0 else (h2h_w - h2h_l) / (h2h_w + h2h_l)

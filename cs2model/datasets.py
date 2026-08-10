@@ -38,6 +38,75 @@ UTC = timezone.utc
 MIN_MAP_SHARE = 0.005
 
 
+def _load_match_level(
+    path, headers, rows, i_date, ta, tb, i_winner, verbose=True, set_pool=True
+) -> List[Match]:
+    """
+    One row per match, no per-map detail.
+
+    Every match gets a single placeholder "map" so the rest of the pipeline
+    still runs, and the pool is set to that one entry. has_map_detail() then
+    returns False and the model switches the veto layer off — the map-level
+    idea simply is not available in data like this, and pretending otherwise
+    would produce confident numbers backed by nothing.
+    """
+    from .data import set_active_pool as _set_pool
+
+    dayfirst = _detect_dayfirst([r[i_date] for r in rows[:500] if len(r) > i_date])
+    matches: List[Match] = []
+    skipped = Counter()
+
+    for r in rows:
+        if max(i_date, ta, tb, i_winner) >= len(r):
+            skipped["short row"] += 1
+            continue
+        d = _parse_date(r[i_date], dayfirst)
+        if d is None:
+            skipped["unparseable date"] += 1
+            continue
+        name_a, name_b = r[ta].strip(), r[tb].strip()
+        if not name_a or not name_b or name_a == name_b:
+            skipped["missing or identical teams"] += 1
+            continue
+
+        raw = r[i_winner].strip()
+        if raw == name_a or raw == "1":
+            winner = name_a
+        elif raw == name_b or raw == "2":
+            winner = name_b
+        else:
+            skipped[f"unrecognised winner value"] += 1
+            continue
+
+        matches.append(Match(
+            team_a=name_a, team_b=name_b, date=d, best_of=3,
+            maps=[MapResult(map_name="Match", winner=winner,
+                            loser=name_b if winner == name_a else name_a)],
+            winner=winner, event="csv",
+        ))
+
+    if not matches:
+        raise ValueError(f"no usable rows in {path}; skipped: {dict(skipped)}")
+
+    matches.sort(key=lambda m: m.date)
+    if set_pool:
+        _set_pool(["Match"], allow_degenerate=True)
+
+    if verbose:
+        teams = {t for m in matches for t in (m.team_a, m.team_b)}
+        print(f"loaded {len(matches)} matches (MATCH-LEVEL, no per-map results)")
+        print(f"  date range   {matches[0].date:%Y-%m-%d} to {matches[-1].date:%Y-%m-%d}")
+        print(f"  teams        {len(teams)}")
+        if skipped:
+            print(f"  skipped rows {dict(skipped)}")
+        print()
+        print("  NOTE: this file has no per-map results, so the per-map ratings")
+        print("  and the veto simulator are switched off. The model falls back")
+        print("  to overall Glicko. That is a weaker model than this project is")
+        print("  designed around — a file with map results would be better.")
+    return matches
+
+
 def _clean_map(name: str) -> str:
     n = str(name).strip().lower()
     n = re.sub(r"^(de|cs)[_\s]+", "", n)
@@ -142,12 +211,30 @@ def load_csv_matches(
     i_map = (_find(headers, "map") or [None])[0]
     score_cols = _find(headers, "pts", "score", "rounds")
     team_cols = _find(headers, "team", "visitor", "home", "opponent")
+    i_winner = (_find(headers, "winner", "result") or [None])[0]
 
-    if i_date is None or i_map is None or len(score_cols) < 2 or len(team_cols) < 2:
+    if i_date is None or len(team_cols) < 2:
         raise ValueError(
             f"could not identify columns in {path}.\n"
             f"  headers: {headers}\n"
-            f"  need a date, a map, two team columns and two score columns."
+            f"  need at least a date and two team columns."
+        )
+
+    # Two shapes exist in the wild. Per-map rows carry a map name and two
+    # scores; match-level rows only say who won. The second kind cannot feed
+    # the per-map ratings or the veto simulator, so it is loaded separately and
+    # flagged, rather than being bent into a shape it does not have.
+    if i_map is None or len(score_cols) < 2:
+        if i_winner is None:
+            raise ValueError(
+                f"could not identify columns in {path}.\n"
+                f"  headers: {headers}\n"
+                f"  need either (map + two scores) for per-map rows, or a "
+                f"winner column for match-level rows."
+            )
+        return _load_match_level(
+            path, headers, rows, i_date, team_cols[0], team_cols[1], i_winner,
+            verbose=verbose, set_pool=set_pool,
         )
 
     ta, tb = team_cols[0], team_cols[1]
