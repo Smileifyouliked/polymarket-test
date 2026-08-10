@@ -36,6 +36,32 @@ ACTIVE_DUTY: Tuple[str, ...] = (
     "Train",
 )
 
+# The pool actually in play. ACTIVE_DUTY above is today's default, but a
+# historical dataset has its own pool (2015 Counter-Strike had Cobblestone and
+# Cache and no Ancient/Anubis), so the loader sets this from the data. Read it
+# through active_pool() rather than importing ACTIVE_DUTY directly, otherwise
+# a module captures the default at import time and never sees the change.
+_ACTIVE_POOL: List[str] = list(ACTIVE_DUTY)
+
+
+def active_pool() -> Tuple[str, ...]:
+    return tuple(_ACTIVE_POOL)
+
+
+def set_active_pool(maps: Sequence[str]) -> Tuple[str, ...]:
+    """
+    Replace the pool in play. Needs at least 7 maps, because the veto scripts
+    ban six and play what is left.
+    """
+    maps = [str(m) for m in maps]
+    if len(maps) < 7:
+        raise ValueError(
+            f"a veto needs at least 7 maps, got {len(maps)}: {maps}"
+        )
+    _ACTIVE_POOL[:] = maps
+    return tuple(_ACTIVE_POOL)
+
+
 # Veto scripts. Index = whose turn, action = ban/pick. The team listed first in
 # the match is "A". Standard competitive formats.
 VETO_SCRIPTS: Dict[int, Sequence[Tuple[str, str]]] = {

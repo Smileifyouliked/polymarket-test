@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from .data import ACTIVE_DUTY, Match, generate_synthetic_league, load_matches, save_matches
+from .data import Match, active_pool, generate_synthetic_league, load_matches, save_matches
 from .evaluate import report, walk_forward
 from .model import CS2Model, build_dataset
 from .ratings import RatingBook
@@ -99,6 +99,18 @@ def cmd_ingest(args) -> int:
     return 0
 
 
+def cmd_load_csv(args) -> int:
+    """Convert a public CSV of match results into the model's format."""
+    from .datasets import load_csv_matches
+
+    matches = load_csv_matches(args.csv)
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    save_matches(matches, args.out)
+    print(f"\nwrote {len(matches)} series -> {args.out}")
+    print(f"now run: python -m cs2model.cli evaluate --data {args.out}")
+    return 0
+
+
 def cmd_evaluate(args) -> int:
     matches = load_matches(args.data)
     print(f"loaded {len(matches)} matches from {args.data}")
@@ -151,7 +163,7 @@ def cmd_predict(args) -> int:
     print(f"  P({args.team_a} wins) = {p:.1%}")
     print()
     print("  per-map probabilities (before the veto):")
-    for m in ACTIVE_DUTY:
+    for m in active_pool():
         mp = map_prob(m)
         bar = "#" * int(round(mp * 30))
         print(f"    {m:<10} {mp:5.1%}  {bar}")
@@ -480,6 +492,11 @@ def main(argv=None) -> int:
     i.add_argument("--pages", type=int, default=20)
     i.add_argument("--per-page", type=int, default=100)
     i.set_defaults(func=cmd_ingest)
+
+    lc = sub.add_parser("load-csv", help="import real results from a CSV file")
+    lc.add_argument("--csv", required=True, help="path to the downloaded CSV")
+    lc.add_argument("--out", default="data/matches.json")
+    lc.set_defaults(func=cmd_load_csv)
 
     v = sub.add_parser("evaluate", help="walk-forward evaluation on saved matches")
     v.add_argument("--data", default="data/matches.json")

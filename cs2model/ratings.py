@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Deque, Dict, Optional, Sequence, Tuple
 
 from . import glicko
-from .data import ACTIVE_DUTY, Match
+from .data import Match, active_pool
 
 # How many maps on a given map before we trust its per-map rating over the
 # team's overall rating. Low = trust thin samples, high = everything is the
@@ -124,7 +124,7 @@ class RatingBook:
         thousands of times per fixture; computing them once and handing over a
         dict turns an O(sims x maps) rating computation into a dict lookup.
         """
-        return {m: self.map_win_prob(a, b, m, now) for m in ACTIVE_DUTY}
+        return {m: self.map_win_prob(a, b, m, now) for m in active_pool()}
 
     def h2h_record(self, a: str, b: str) -> Tuple[int, int]:
         key = (a, b) if a < b else (b, a)

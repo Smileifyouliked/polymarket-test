@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .data import ACTIVE_DUTY, Match
+from .data import Match, active_pool
 from .model import CS2Model, build_features
 from .polymarket import BookTop, MarketInfo, PolymarketVenue, normalise_team
 from .ratings import RatingBook
@@ -158,7 +158,7 @@ class Strategy:
         if not m.team_a or not m.team_b:
             d.reason = "could not parse teams from the question"
             return d
-        if m.market_kind == "map" and m.map_name not in ACTIVE_DUTY:
+        if m.market_kind == "map" and m.map_name not in active_pool():
             d.reason = f"map {m.map_name or '?'} not in the active pool"
             return d
 
