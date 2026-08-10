@@ -109,3 +109,55 @@ def test_degenerate_pool_is_refused_unless_asked_for():
         set_active_pool(["OnlyOne"])
     set_active_pool(["OnlyOne"], allow_degenerate=True)
     assert not has_map_detail()
+
+
+# ── the HLTV wide format (one row per match, with lineups) ───────────────────
+
+HLTV = """match_id,date,tournament,winner,score_team1,score_team2,winner_map,loser_map,decider_map,event_type,team1_name,team1_player_1_name,team1_player_2_name,team1_player_3_name,team1_player_4_name,team1_player_5_name,team2_name,team2_player_1_name,team2_player_2_name,team2_player_3_name,team2_player_4_name,team2_player_5_name
+1,2025-01-05,IEM,Vitality,2,1,Mirage,Nuke,Inferno,LAN,Vitality,ZywOo,apEX,flameZ,mezii,ropz,Spirit,donk,zont1x,sh1ro,chopper,magixx
+2,2025-01-06,IEM,NAVI,0,2,Dust2,,Ancient,Online,FaZe,karrigan,rain,frozen,ropz,broky,NAVI,w0nderful,b1t,iM,Aleksib,jL
+3,2025-01-07,IEM,Vitality,2,1,Train,Anubis,Overpass,LAN,Vitality,ZywOo,apEX,flameZ,mezii,NEWGUY,NAVI,w0nderful,b1t,iM,Aleksib,jL
+"""
+
+
+def test_hltv_format_is_detected_and_parsed(tmp_path):
+    ms = load_csv_matches(_write(tmp_path, "h.csv", HLTV), verbose=False)
+    assert len(ms) == 3
+    assert ms[0].team_a == "Vitality" and ms[0].winner == "Vitality"
+    assert ms[0].lan is True
+    assert ms[1].lan is False
+
+
+def test_hltv_lineups_are_captured(tmp_path):
+    """Lineups drive the roster-change mechanism, dormant without them."""
+    ms = load_csv_matches(_write(tmp_path, "h.csv", HLTV), verbose=False)
+    assert ms[0].lineup_a == ("ZywOo", "apEX", "flameZ", "mezii", "ropz")
+    assert len(ms[0].lineup_b) == 5
+
+
+def test_no_decider_map_is_invented_on_a_sweep(tmp_path):
+    """
+    A 2-0 has no decider. The column can still be populated, and counting it
+    would invent a map that was never played and award it to the favourite.
+    """
+    ms = load_csv_matches(_write(tmp_path, "h.csv", HLTV), verbose=False)
+    sweep = [m for m in ms if m.team_a == "FaZe"][0]
+    assert len(sweep.maps) == 1, [r.map_name for r in sweep.maps]
+    assert "Ancient" not in [r.map_name for r in sweep.maps]
+
+    split = [m for m in ms if m.team_b == "Spirit"][0]
+    assert len(split.maps) == 3
+
+
+def test_hltv_map_results_go_to_the_right_team(tmp_path):
+    ms = load_csv_matches(_write(tmp_path, "h.csv", HLTV), verbose=False)
+    m = ms[0]
+    by_map = {r.map_name: r.winner for r in m.maps}
+    assert by_map["Mirage"] == "Vitality"   # winner_map
+    assert by_map["Nuke"] == "Spirit"       # loser_map
+    assert by_map["Inferno"] == "Vitality"  # decider goes to the series winner
+
+
+def test_hltv_best_of_comes_from_the_series_score(tmp_path):
+    ms = load_csv_matches(_write(tmp_path, "h.csv", HLTV), verbose=False)
+    assert all(m.best_of == 3 for m in ms)

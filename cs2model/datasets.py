@@ -107,6 +107,147 @@ def _load_match_level(
     return matches
 
 
+_HLTV_REQUIRED = ("team1_name", "team2_name", "winner", "date")
+
+
+def _load_hltv_wide(path, headers, rows, verbose=True, set_pool=True) -> List[Match]:
+    """
+    The HLTV-scrape shape: one row per MATCH, wide, with player names.
+
+    Two things make this format worth special-casing:
+
+      1. It carries full lineups (team{N}_player_{1..5}_name), which is the
+         only real dataset here that can drive the roster-change mechanism.
+      2. Its map columns are labelled BY OUTCOME — winner_map / loser_map /
+         decider_map — not by team. That is a leakage trap: anything named
+         winner_* encodes the result. They are used ONLY to reconstruct which
+         maps were played and who won them, which is the label we learn from,
+         never as a pre-match feature.
+    """
+    from .data import set_active_pool as _set_pool
+
+    idx = {h.strip().lower(): i for i, h in enumerate(headers)}
+
+    def col(name, r, default=""):
+        i = idx.get(name)
+        if i is None or i >= len(r):
+            return default
+        return r[i].strip()
+
+    matches: List[Match] = []
+    skipped = Counter()
+    seen_maps = Counter()
+
+    for r in rows:
+        d = _parse_date(col("date", r), dayfirst=False)
+        if d is None:
+            skipped["unparseable date"] += 1
+            continue
+
+        a, b = col("team1_name", r), col("team2_name", r)
+        if not a or not b or a == b:
+            skipped["missing or identical teams"] += 1
+            continue
+
+        raw_winner = col("winner", r)
+        if raw_winner == a or raw_winner == "1":
+            winner = a
+        elif raw_winner == b or raw_winner == "2":
+            winner = b
+        else:
+            skipped["unrecognised winner"] += 1
+            continue
+        loser = b if winner == a else a
+
+        try:
+            s1, s2 = int(col("score_team1", r, "0")), int(col("score_team2", r, "0"))
+        except ValueError:
+            s1 = s2 = 0
+        top = max(s1, s2)
+        best_of = 1 if top <= 1 else (3 if top == 2 else 5)
+
+        # Reconstruct the maps. winner_map / loser_map say who took what; the
+        # decider is the last map of a split series, so the series winner took
+        # it. Anything that is not a recognised map name is dropped rather than
+        # guessed at.
+        # A decider only exists if the series was actually split. On a 2-0 the
+        # column may still be populated (the map that would have been played),
+        # and counting it would invent a game that never happened and hand its
+        # win to the favourite.
+        split = min(s1, s2) >= 1
+        sources = [("winner_map", winner), ("loser_map", loser)]
+        if split:
+            sources.append(("decider_map", winner))
+
+        results: List[MapResult] = []
+        for key, map_winner in sources:
+            name = _clean_map(col(key, r))
+            if not name or name.lower() in ("", "nan", "none", "tbd"):
+                continue
+            results.append(MapResult(
+                map_name=name,
+                winner=map_winner,
+                loser=loser if map_winner == winner else winner,
+            ))
+            seen_maps[name] += 1
+
+        if not results:
+            # No usable map detail on this row: keep the match, but as a single
+            # placeholder so the series still teaches the overall rating.
+            results = [MapResult(map_name="Match", winner=winner, loser=loser)]
+
+        def lineup(team_no):
+            names = [col(f"team{team_no}_player_{i}_name", r) for i in range(1, 6)]
+            names = [n for n in names if n and n.lower() not in ("nan", "none")]
+            return tuple(names)
+
+        event_type = col("event_type", r).lower()
+        matches.append(Match(
+            team_a=a, team_b=b, date=d, best_of=best_of, maps=results,
+            winner=winner,
+            lan="lan" in event_type or "offline" in event_type,
+            event=col("tournament", r),
+            lineup_a=lineup(1), lineup_b=lineup(2),
+        ))
+
+    if not matches:
+        raise ValueError(f"no usable rows in {path}; skipped: {dict(skipped)}")
+
+    matches.sort(key=lambda m: m.date)
+
+    total_maps = sum(seen_maps.values())
+    pool = [m for m, c in seen_maps.most_common()
+            if total_maps and c / total_maps >= MIN_MAP_SHARE and m != "Match"]
+
+    if set_pool:
+        if len(pool) >= 7:
+            _set_pool(pool)
+        else:
+            _set_pool(["Match"], allow_degenerate=True)
+
+    if verbose:
+        teams = {t for m in matches for t in (m.team_a, m.team_b)}
+        with_lineups = sum(1 for m in matches if len(m.lineup_a) == 5)
+        bo = Counter(m.best_of for m in matches)
+        lan = sum(1 for m in matches if m.lan)
+        print(f"loaded {len(matches)} matches (HLTV wide format)")
+        print(f"  date range   {matches[0].date:%Y-%m-%d} to {matches[-1].date:%Y-%m-%d}")
+        print(f"  teams        {len(teams)}")
+        print(f"  formats      " + ", ".join(f"Bo{k}: {v}" for k, v in sorted(bo.items())))
+        print(f"  LAN matches  {lan}  ({lan / len(matches):.0%})")
+        print(f"  full 5-man lineups on {with_lineups} matches "
+              f"({with_lineups / len(matches):.0%}) — roster tracking active")
+        if len(pool) >= 7:
+            print(f"  map pool     {', '.join(pool)}")
+            print(f"  per-map results reconstructed for {total_maps} maps")
+        else:
+            print(f"  NOTE: only {len(pool)} distinct maps found, so per-map "
+                  f"ratings and the veto simulator are OFF.")
+        if skipped:
+            print(f"  skipped rows {dict(skipped)}")
+    return matches
+
+
 def _clean_map(name: str) -> str:
     n = str(name).strip().lower()
     n = re.sub(r"^(de|cs)[_\s]+", "", n)
@@ -206,6 +347,10 @@ def load_csv_matches(
     headers, rows = _rows_with_positions(path)
     if not rows:
         raise ValueError(f"{path} has no data rows")
+
+    lower = {h.strip().lower() for h in headers}
+    if all(c in lower for c in _HLTV_REQUIRED):
+        return _load_hltv_wide(path, headers, rows, verbose=verbose, set_pool=set_pool)
 
     i_date = (_find(headers, "date") or [None])[0]
     i_map = (_find(headers, "map") or [None])[0]
