@@ -333,6 +333,14 @@ That last line makes the file private. Kaggle refuses to run without it.
 kaggle datasets download -d griffindesroches/cs2-hltv-professional-match-statistics-dataset
 ```
 
+The `data` folder is not in the download (it is listed in `.gitignore`), so
+create it before unzipping — `unzip` will not build a nested path whose parent
+is missing:
+
+```
+mkdir -p data/kaggle
+```
+
 ```
 unzip -o *.zip -d data/kaggle
 ```
@@ -396,6 +404,8 @@ the proper test.
 | `kaggle: command not found` | You forgot `source venv/bin/activate` |
 | `Could not find kaggle.json` | Step 7.3 did not save. Try `cat ~/.kaggle/kaggle.json` to check |
 | `403 Forbidden` | The token is wrong, or you have not accepted the dataset's terms — open the dataset page in your browser once and click Download |
+| `cannot create extraction directory` | The `data` folder does not exist. Run `mkdir -p data/kaggle` first |
+| The `.zip` is not where you are | Run `cd ~/polymarket-test` then `mv ~/*.zip .` |
 | `unzip: command not found` | Run `sudo apt install -y unzip`. Or unzip without installing anything: `python3 -c "import zipfile,glob; [zipfile.ZipFile(z).extractall('data/kaggle') for z in glob.glob('*.zip')]"` |
 | `could not identify columns` | Expected — that is why I need the header line first |
 
