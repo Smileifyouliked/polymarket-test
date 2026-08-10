@@ -111,6 +111,14 @@ class Match:
     maps: List[MapResult] = field(default_factory=list)
     winner: Optional[str] = None
 
+    # False when the source could not tell us every map that was played.
+    # Partial map records are not merely incomplete, they are BIASED: a
+    # winner_map/loser_map/decider_map layout records all three maps of a 2-1
+    # but only one map of a 2-0, and the ones it drops are the winner's. Per-map
+    # ratings fed that diet systematically under-credit strong teams on their
+    # best maps. Such matches still teach the overall rating.
+    maps_complete: bool = True
+
     # Context that moves the needle in CS specifically.
     lan: bool = False
     tier: int = 2  # 1 = top international, 3 = regional filler
@@ -144,6 +152,7 @@ class Match:
             best_of=d["best_of"],
             maps=maps,
             winner=d.get("winner"),
+            maps_complete=d.get("maps_complete", True),
             lan=d.get("lan", False),
             tier=d.get("tier", 2),
             event=d.get("event", ""),

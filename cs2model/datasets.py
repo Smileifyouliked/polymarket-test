@@ -241,9 +241,16 @@ def _load_hltv_wide(path, headers, rows, verbose=True, set_pool=True) -> List[Ma
             return tuple(names)
 
         event_type = col("event_type", r).lower()
+        # We know how many maps were played (the score says so). If we could
+        # not name them all, the record is partial and biased — flag it.
+        expected_maps = s1 + s2 if (s1 + s2) > 0 else len(results)
+        complete = len(results) == expected_maps and results[0].map_name != "Match"
+        if not complete:
+            skipped["partial map record (overall rating only)"] += 1
+
         matches.append(Match(
             team_a=a, team_b=b, date=d, best_of=best_of, maps=results,
-            winner=winner,
+            winner=winner, maps_complete=complete,
             lan="lan" in event_type or "offline" in event_type,
             event=col("tournament", r),
             lineup_a=lineup(1), lineup_b=lineup(2),

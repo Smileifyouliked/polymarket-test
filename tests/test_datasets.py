@@ -194,3 +194,27 @@ def test_failures_report_the_offending_values(tmp_path):
     with pytest.raises(ValueError) as e:
         load_csv_matches(_write(tmp_path, "b.csv", bad), verbose=False)
     assert "NOT_A_DATE" in str(e.value)
+
+
+def test_partial_map_records_are_flagged(tmp_path):
+    """
+    A 2-0 names only one of the two maps played, and the one it drops is the
+    winner's. Feeding that to per-map ratings biases every strong team down.
+    """
+    ms = load_csv_matches(_write(tmp_path, "h.csv", HLTV), verbose=False)
+    split = [m for m in ms if m.team_b == "Spirit"][0]     # 2-1, all 3 named
+    sweep = [m for m in ms if m.team_a == "FaZe"][0]       # 0-2, only 1 named
+    assert split.maps_complete is True
+    assert sweep.maps_complete is False
+
+
+def test_partial_records_skip_per_map_ratings_but_still_teach_overall(tmp_path):
+    from cs2model.ratings import RatingBook
+
+    ms = load_csv_matches(_write(tmp_path, "h.csv", HLTV), verbose=False)
+    sweep = [m for m in ms if m.team_a == "FaZe"][0]
+    book = RatingBook()
+    book.observe(sweep)
+    winner = book.team(sweep.winner)
+    assert winner.per_map == {}, "a biased map record must not move per-map ratings"
+    assert winner.overall.games == 1, "but the series still teaches the overall rating"
