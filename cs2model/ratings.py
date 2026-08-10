@@ -191,7 +191,12 @@ class RatingBook:
         sa, sb = self.teams[a], self.teams[b]
 
         # Learn map by map. This is where the per-map identity comes from.
-        for mr in match.maps:
+        #
+        # Skipped entirely when the map record is known to be partial: a biased
+        # sample is worse than no sample, because it shifts every per-map rating
+        # in the same direction instead of just adding noise. The overall rating
+        # below still learns from the series.
+        for mr in (match.maps if match.maps_complete else ()):
             wa = mr.winner == a
             ra = sa.per_map.get(mr.map_name) or sa.overall.copy()
             rb = sb.per_map.get(mr.map_name) or sb.overall.copy()

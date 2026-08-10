@@ -48,18 +48,35 @@ def active_pool() -> Tuple[str, ...]:
     return tuple(_ACTIVE_POOL)
 
 
-def set_active_pool(maps: Sequence[str]) -> Tuple[str, ...]:
+def set_active_pool(maps: Sequence[str], allow_degenerate: bool = False) -> Tuple[str, ...]:
     """
-    Replace the pool in play. Needs at least 7 maps, because the veto scripts
-    ban six and play what is left.
+    Replace the pool in play. A real veto needs at least 7 maps, because the
+    scripts ban six and play what is left.
+
+    `allow_degenerate` exists for datasets that record only who won the match
+    and never which maps were played. There is no veto to simulate there, so
+    the model falls back to rating teams overall — see has_map_detail().
     """
     maps = [str(m) for m in maps]
-    if len(maps) < 7:
+    if len(maps) < 7 and not allow_degenerate:
         raise ValueError(
-            f"a veto needs at least 7 maps, got {len(maps)}: {maps}"
+            f"a veto needs at least 7 maps, got {len(maps)}: {maps}. "
+            f"Pass allow_degenerate=True for match-level-only data."
         )
     _ACTIVE_POOL[:] = maps
     return tuple(_ACTIVE_POOL)
+
+
+def has_map_detail() -> bool:
+    """
+    False when the loaded data has no per-map results.
+
+    This is not a detail — it decides whether the central idea of this project
+    (rate teams per map, simulate the veto) is usable at all. With match-level
+    data only, the model degrades to plain Glicko and the veto layer is
+    switched off rather than fed nonsense.
+    """
+    return len(_ACTIVE_POOL) >= 7
 
 
 # Veto scripts. Index = whose turn, action = ban/pick. The team listed first in
@@ -94,6 +111,14 @@ class Match:
     maps: List[MapResult] = field(default_factory=list)
     winner: Optional[str] = None
 
+    # False when the source could not tell us every map that was played.
+    # Partial map records are not merely incomplete, they are BIASED: a
+    # winner_map/loser_map/decider_map layout records all three maps of a 2-1
+    # but only one map of a 2-0, and the ones it drops are the winner's. Per-map
+    # ratings fed that diet systematically under-credit strong teams on their
+    # best maps. Such matches still teach the overall rating.
+    maps_complete: bool = True
+
     # Context that moves the needle in CS specifically.
     lan: bool = False
     tier: int = 2  # 1 = top international, 3 = regional filler
@@ -127,6 +152,7 @@ class Match:
             best_of=d["best_of"],
             maps=maps,
             winner=d.get("winner"),
+            maps_complete=d.get("maps_complete", True),
             lan=d.get("lan", False),
             tier=d.get("tier", 2),
             event=d.get("event", ""),

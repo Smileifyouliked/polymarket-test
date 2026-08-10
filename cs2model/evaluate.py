@@ -145,6 +145,33 @@ def expected_calibration_error(y: np.ndarray, p: np.ndarray, bins: int = 10) -> 
     return float(sum(r["n"] / n * abs(r["predicted"] - r["actual"]) for r in rows))
 
 
+def tail_calibration_error(
+    y: np.ndarray, p: np.ndarray, threshold: float = 0.65, min_n: int = 30
+) -> Optional[float]:
+    """
+    Calibration ON THE CONFIDENT PREDICTIONS ONLY.
+
+    WHY ECE ALONE IS NOT ENOUGH — this hid a real failure.
+      ECE weights each bucket by size. On a real run the model scored 0.0205,
+      comfortably "healthy", because 3,200 of 3,517 matches sat near 0.5 where
+      it was fine. In the 0.80-0.90 bucket it predicted 83% and delivered 40%.
+      The average drowned the tails.
+
+      A betting bot only ever acts on the tails. Calibration that is measured
+      where the bot does not trade is not measuring anything that matters.
+
+    Returns None when too few confident predictions exist to judge.
+    """
+    conf = np.maximum(p, 1.0 - p)
+    mask = conf >= threshold
+    if int(mask.sum()) < min_n:
+        return None
+    called_a = p[mask] >= 0.5
+    predicted = float(np.mean(conf[mask]))
+    actual = float(np.mean(called_a == (y[mask] == 1)))
+    return abs(predicted - actual)
+
+
 @dataclass
 class WalkForwardResult:
     y: np.ndarray
@@ -244,7 +271,15 @@ def report(res: WalkForwardResult, true_p: Optional[np.ndarray] = None) -> str:
     lines.append("")
 
     ece = expected_calibration_error(res.y, res.p_model)
-    lines.append(f"  calibration error (ECE): {ece:.4f}   <- lower is better; under ~0.03 is healthy")
+    lines.append(f"  calibration error (ECE): {ece:.4f}   <- size-weighted; the middle dominates it")
+    tail = tail_calibration_error(res.y, res.p_model)
+    if tail is None:
+        lines.append("  confident-call calibration: too few confident predictions to judge")
+    else:
+        verdict = "OK" if tail < 0.05 else "BROKEN — do not bet on this"
+        lines.append(f"  confident-call calibration: {tail:.4f}  {verdict}")
+        lines.append("      (only predictions above 65% confidence — the ones a bot acts on.")
+        lines.append("       This is the number that matters; ECE can look healthy while this fails.)")
     if true_p is not None and len(true_p) == len(res.y):
         rmse = float(np.sqrt(np.mean((res.p_model - true_p) ** 2)))
         lines.append(f"  RMSE vs TRUE probability: {rmse:.4f}   <- synthetic data only")

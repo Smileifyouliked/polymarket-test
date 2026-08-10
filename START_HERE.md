@@ -16,7 +16,7 @@ what you saw. Do not skip ahead.
 |---|---|---|---|---|
 | 1 | Your AWS server | ✅ you said you have one | — | Step 1 |
 | 2 | The `.pem` key file for that server | check your Downloads folder | — | Step 1 |
-| 3 | A Liquipedia API key | ❌ you need to get this | Free | Step 6 |
+| 3 | A free Kaggle account | ❌ you need this | Free | Step 7 |
 | 4 | A Polymarket account | ❌ **not yet** | Free | Much later |
 | 5 | Money in a crypto wallet | ❌ **not yet** | — | Much later, maybe never |
 
@@ -123,7 +123,7 @@ computer.** Everything from here happens on the server.
 Copy and paste this whole line, then press Enter:
 
 ```
-sudo apt update && sudo apt install -y python3 python3-venv python3-pip git tmux
+sudo apt update && sudo apt install -y python3 python3-venv python3-pip git tmux unzip
 ```
 
 This installs Python (the language the program is written in) and a few
@@ -132,7 +132,7 @@ helpers. It takes a minute or two and prints a lot of text. That is normal.
 > If that gives an error saying `apt: command not found`, your server is a
 > different flavour of Linux. Use this instead:
 > ```
-> sudo dnf install -y python3 python3-pip git tmux
+> sudo dnf install -y python3 python3-pip git tmux unzip
 > ```
 
 Now check Python is there:
@@ -146,6 +146,35 @@ python3 --version
 
 ---
 
+## Starting over from scratch
+
+If you installed an earlier version and want a completely clean slate, this is
+safe and takes one command.
+
+Everything the program installed lives inside a single folder called
+`polymarket-test`, including the Python sandbox. Deleting that folder removes
+all of it. Nothing else on your server is touched.
+
+```
+rm -rf ~/polymarket-test
+```
+
+Type it exactly. The `~/` means "my home folder", so it can only ever delete
+that one folder no matter where you are.
+
+Check it is gone:
+
+```
+ls ~
+```
+
+**You should see:** no `polymarket-test` in the list.
+
+**What you do NOT need to redo:** Step 3. Python, git and tmux stay installed
+on the server — they live outside the folder. Go straight to Step 4 below.
+
+---
+
 ## Step 4 — Download the program
 
 ```
@@ -156,12 +185,14 @@ git clone https://github.com/Smileifyouliked/polymarket-test.git
 cd polymarket-test
 ```
 
-```
-git checkout claude/polymarket-github-repos-xomddj
-```
+What these do: download the code, then move into the folder. The `main`
+branch already has everything, so there is no branch to switch to.
 
-What these do, in order: download the code, move into the folder, switch to
-the version with all the latest work in it.
+> **Already downloaded it earlier?** Get the newest version instead:
+> ```
+> cd polymarket-test && git checkout main && git pull
+> ```
+> You do NOT need to reinstall anything. Steps 3 and 5 stay done.
 
 ```
 ls
@@ -247,131 +278,152 @@ Everything so far used pretend data. Now we get real data.
 
 ---
 
-## Step 7 — Get your Liquipedia key
+## Step 7 — Get the match data
 
-**What is this?** Liquipedia is a website that records every professional
-Counter-Strike match ever played. We need that history to teach the model who
-is good. They give the data away free, but they want you to identify
-yourself, so they give you a **key** — a long password-like string that says
-"this is me".
+**What changed and why:** the original plan was Liquipedia. It turned out their
+free data is only for education and non-commercial sites, and they currently
+only sell an Enterprise plan. So we switched to a public dataset of real CS2
+matches instead. It is free, it needs no approval, and it is actually the
+better test — it covers about 18 months of CS2 rather than a live trickle.
 
-**What to do:**
+**Nothing you have already done is wasted.** Steps 1 to 6 are unchanged.
 
-1. Open a normal web browser on your own computer.
-2. Go to: **https://liquipedia.net/api-terms-of-use**
-3. Follow whatever it asks. It is free. You will likely need to make an
-   account and agree to their rules.
-4. At the end you get a key. It looks like a long jumble of letters and
-   numbers.
-5. Copy it.
+### 7.1 Make a Kaggle account
 
-> I cannot see that website from where I am, so I cannot tell you exactly
-> which buttons to press. If any part confuses you, take a screenshot or copy
-> the text and send it to me.
+Kaggle is a free website that hosts public datasets. Go to
+**https://www.kaggle.com** and sign up.
 
-**Now put the key on your server.** Back in your terminal, type these three
-lines, replacing `PASTE_YOUR_KEY_HERE` with the key you copied, and
-`your@email.com` with your real email:
+### 7.2 Get your Kaggle token
 
-```
-echo 'export LIQUIPEDIA_API_KEY=PASTE_YOUR_KEY_HERE' >> ~/.bashrc
-```
+1. Click your profile picture (top right) → **Settings**
+2. Scroll to **API** → click **Create New Token**
+3. A small file called `kaggle.json` downloads
+4. Open it in Notepad or TextEdit and copy everything inside. It is one short
+   line that looks like `{"username":"...","key":"..."}`
+
+### 7.3 Put the token on your server
 
 ```
-echo 'export LIQUIPEDIA_USER_AGENT="cs2model/0.1 (your@email.com)"' >> ~/.bashrc
+pip install kaggle
 ```
 
 ```
-source ~/.bashrc
+mkdir -p ~/.kaggle
 ```
 
-Check it worked:
-
 ```
-echo $LIQUIPEDIA_API_KEY
+nano ~/.kaggle/kaggle.json
 ```
 
-**You should see:** your key printed back at you.
+A simple text editor opens. **Paste** what you copied. Then press `Ctrl+O`,
+press `Enter`, then press `Ctrl+X` to save and quit.
 
-> **The email is not optional.** Liquipedia asks who is using their data and
-> blocks programs that will not say. Use a real email.
+```
+chmod 600 ~/.kaggle/kaggle.json
+```
 
-> ### 🔒 Keep the key private
-> Never put this key in a message, a file inside the `polymarket-test`
-> folder, or anywhere on the internet. The `~/.bashrc` file we used is
-> outside the project folder on purpose, so it can never be uploaded by
-> accident.
+That last line makes the file private. Kaggle refuses to run without it.
+
+> 🔒 This token is a password. Never put it in a message, or in the
+> `polymarket-test` folder. `~/.kaggle/` is outside the project on purpose.
+
+### 7.4 Download the data
+
+```
+kaggle datasets download -d griffindesroches/cs2-hltv-professional-match-statistics-dataset
+```
+
+The `data` folder is not in the download (it is listed in `.gitignore`), so
+create it before unzipping — `unzip` will not build a nested path whose parent
+is missing:
+
+```
+mkdir -p data/kaggle
+```
+
+```
+unzip -o *.zip -d data/kaggle
+```
+
+```
+ls data/kaggle
+```
+
+**You should see:** one or more `.csv` files listed.
 
 ---
 
-## Step 8 — The two commands I need from you
-
-This is the step everything else is waiting on.
-
-**Why:** I wrote the part of the program that reads Liquipedia's data by
-following their written instructions — but I have never been able to actually
-connect to them and see what their data looks like. So my code is an educated
-guess. These two commands show me the real thing so I can correct it.
-
-**Command one:**
+## Step 8 — The one thing I need from you
 
 ```
-python3 -m cs2model.cli explore --limit 3 --save data/raw_finished.json
+head -1 data/kaggle/*.csv
 ```
 
-**Command two:**
+That prints the first line of the file — the column names.
+
+**Copy that and send it to me.**
+
+**Why:** the file has around 116 columns and I have never seen it. The loader
+I wrote expects one row per map; this file is probably one row per match. I
+need to see the real column names to make them fit. I would rather look than
+guess — guessing at data formats is what caused most of the bugs we have
+already had to fix.
+
+Then I will update the loader, and you run these two:
 
 ```
-python3 -m cs2model.cli explore --limit 3 --conditions "[[winner::]]" --save data/raw_upcoming.json
+python3 -m cs2model.cli load-csv --csv data/kaggle/YOUR_FILE.csv --out data/matches.json
 ```
 
-The first gets matches that already happened. The second gets matches that
-have not been played yet.
-
-**Then send me:**
-- Everything the commands printed on screen (copy and paste it), **and**
-- The two files they created, which are at `data/raw_finished.json` and
-  `data/raw_upcoming.json`
-
-To see a file's contents so you can copy it:
-
 ```
-cat data/raw_finished.json
+python3 -m cs2model.cli evaluate --data data/matches.json
 ```
 
-**These files contain match results only. There is no password or key inside
-them. They are safe to share.**
+### 🎯 That second command is the whole point
 
-### If you get an error, that is still useful — send it to me
+It prints a table like this:
 
-| Error message | What it means |
+```
+always-pick-favourite   acc= 0.591
+FULL MODEL              acc= 0.595
+```
+
+If **FULL MODEL** beats **always-pick-favourite** by a clear margin, the model
+is worth something and we carry on. If it does not, we stop and fix it rather
+than betting on it.
+
+I already ran this on a smaller, older dataset: the model scored 59.5% against
+a 59.1% baseline. That is not good enough to bet with. That test used only 3
+months of 2015 data though, which is too thin to be fair — this Kaggle set is
+the proper test.
+
+### If something goes wrong
+
+| Error | What it means |
 |---|---|
-| `LIQUIPEDIA_API_KEY is not set` | Step 7 did not stick. Close the terminal, connect again, redo Step 7 |
-| `HTTP 401` | The key is wrong, or not switched on yet |
-| `HTTP 429` | You asked too fast. Wait 10 minutes and try once more |
-| `Could not find a working base URL` | My guess at their web address was wrong. Send me the whole message |
-| `ModuleNotFoundError` | You forgot `source venv/bin/activate` |
+| `kaggle: command not found` | You forgot `source venv/bin/activate` |
+| `Could not find kaggle.json` | Step 7.3 did not save. Try `cat ~/.kaggle/kaggle.json` to check |
+| `403 Forbidden` | The token is wrong, or you have not accepted the dataset's terms — open the dataset page in your browser once and click Download |
+| `cannot create extraction directory` | The `data` folder does not exist. Run `mkdir -p data/kaggle` first |
+| The `.zip` is not where you are | Run `cd ~/polymarket-test` then `mv ~/*.zip .` |
+| `unzip: command not found` | Run `sudo apt install -y unzip`. Or unzip without installing anything: `python3 -c "import zipfile,glob; [zipfile.ZipFile(z).extractall('data/kaggle') for z in glob.glob('*.zip')]"` |
+| `could not identify columns` | Expected — that is why I need the header line first |
 
 ---
 
 ## What happens after that
 
-You do not need to do these yet. This is just so you know where we are going.
-
 | Step | What it is | Real money? |
 |---|---|---|
-| 9 | I fix the code using your files | No |
-| 10 | Download years of match history | No |
-| 11 | **Test if the model is actually any good** | No |
+| 9 | I adapt the loader to the real columns | No |
+| 10 | **Test if the model actually beats picking the favourite** | No |
+| 11 | If it passes: connect live Polymarket prices | No |
 | 12 | Run the bot in practice mode for 1-2 weeks | No |
-| 13 | Only if step 11 and 12 both look good — consider real money | Yes |
+| 13 | Only if 10 and 12 both look good — consider real money | Yes |
 
-**Step 11 is the important one.** It tells us whether this whole thing
-predicts matches better than just picking whoever is favourite. If it does
-not, we stop and fix it rather than betting on it. I would rather find that
-out for free than with your money.
-
----
+**Step 10 is the important one.** If the model cannot beat picking the
+favourite, nothing after it matters. I would rather find that out for free
+than with your money.
 
 ## Things NOT to do yet
 
@@ -408,8 +460,11 @@ so it cannot break anything else.
 **API key** — a long password that identifies you to a website when your
 program talks to it instead of you clicking around.
 
-**Liquipedia** — the website with the history of every pro Counter-Strike
-match.
+**Kaggle** — a free website hosting public datasets. This is where the match
+history comes from.
+
+**Liquipedia** — another Counter-Strike data source. We do not use it: their
+free tier is education-only and they currently sell only an Enterprise plan.
 
 **Polymarket** — the website where you could eventually place bets. Not yet.
 

@@ -409,3 +409,45 @@ def test_missing_scores_do_not_give_the_winner_zero_rounds():
     rec["match2games"] = [{"map": "de_nuke", "winner": "2", "scores": ["7", "13"]}]
     m2 = _to_match(rec)
     assert (m2.maps[0].rounds_winner, m2.maps[0].rounds_loser) == (13, 7)
+
+
+def test_tail_calibration_catches_what_ece_hides():
+    """
+    The real failure this was written for: ECE 0.0205 read as healthy while the
+    0.80-0.90 bucket predicted 83% and delivered 40%. A bot only acts on the
+    tails, so calibration measured where it does not trade measures nothing.
+    """
+    from cs2model.evaluate import tail_calibration_error
+
+    rng = np.random.default_rng(0)
+
+    # A genuinely calibrated middle — y drawn FROM p, not independently of it,
+    # or the middle contributes error of its own and the test proves nothing.
+    p_mid = rng.uniform(0.42, 0.58, 3000)
+    y_mid = (rng.random(3000) < p_mid).astype(int)
+
+    # A small confident tail that is badly wrong: says 85%, wins 40%.
+    p_tail = np.full(120, 0.85)
+    y_tail = (rng.random(120) < 0.40).astype(int)
+
+    p = np.concatenate([p_mid, p_tail])
+    y = np.concatenate([y_mid, y_tail])
+
+    ece = expected_calibration_error(y, p)
+    tail = tail_calibration_error(y, p, threshold=0.65)
+
+    assert ece < 0.03, (
+        f"ECE reads as healthy ({ece:.4f}) — that is exactly the trap, since "
+        f"the tail is off by {tail:.2f}"
+    )
+    assert tail is not None and tail > 0.30, (
+        f"tail calibration must expose it, got {tail}"
+    )
+
+
+def test_tail_calibration_declines_to_judge_a_thin_sample():
+    from cs2model.evaluate import tail_calibration_error
+
+    p = np.array([0.9, 0.1, 0.85])
+    y = np.array([1, 0, 1])
+    assert tail_calibration_error(p=p, y=y, threshold=0.65) is None

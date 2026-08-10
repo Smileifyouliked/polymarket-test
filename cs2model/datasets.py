@@ -38,17 +38,307 @@ UTC = timezone.utc
 MIN_MAP_SHARE = 0.005
 
 
+def _load_match_level(
+    path, headers, rows, i_date, ta, tb, i_winner, verbose=True, set_pool=True
+) -> List[Match]:
+    """
+    One row per match, no per-map detail.
+
+    Every match gets a single placeholder "map" so the rest of the pipeline
+    still runs, and the pool is set to that one entry. has_map_detail() then
+    returns False and the model switches the veto layer off — the map-level
+    idea simply is not available in data like this, and pretending otherwise
+    would produce confident numbers backed by nothing.
+    """
+    from .data import set_active_pool as _set_pool
+
+    dayfirst = _detect_dayfirst([r[i_date] for r in rows[:500] if len(r) > i_date])
+    matches: List[Match] = []
+    skipped = Counter()
+
+    for r in rows:
+        if max(i_date, ta, tb, i_winner) >= len(r):
+            skipped["short row"] += 1
+            continue
+        d = _parse_date(r[i_date], dayfirst)
+        if d is None:
+            skipped["unparseable date"] += 1
+            continue
+        name_a, name_b = r[ta].strip(), r[tb].strip()
+        if not name_a or not name_b or name_a == name_b:
+            skipped["missing or identical teams"] += 1
+            continue
+
+        raw = r[i_winner].strip()
+        if raw == name_a or raw == "1":
+            winner = name_a
+        elif raw == name_b or raw == "2":
+            winner = name_b
+        else:
+            skipped[f"unrecognised winner value"] += 1
+            continue
+
+        matches.append(Match(
+            team_a=name_a, team_b=name_b, date=d, best_of=3,
+            maps=[MapResult(map_name="Match", winner=winner,
+                            loser=name_b if winner == name_a else name_a)],
+            winner=winner, event="csv",
+        ))
+
+    if not matches:
+        raise ValueError(f"no usable rows in {path}; skipped: {dict(skipped)}")
+
+    matches.sort(key=lambda m: m.date)
+    if set_pool:
+        _set_pool(["Match"], allow_degenerate=True)
+
+    if verbose:
+        teams = {t for m in matches for t in (m.team_a, m.team_b)}
+        print(f"loaded {len(matches)} matches (MATCH-LEVEL, no per-map results)")
+        print(f"  date range   {matches[0].date:%Y-%m-%d} to {matches[-1].date:%Y-%m-%d}")
+        print(f"  teams        {len(teams)}")
+        if skipped:
+            print(f"  skipped rows {dict(skipped)}")
+        print()
+        print("  NOTE: this file has no per-map results, so the per-map ratings")
+        print("  and the veto simulator are switched off. The model falls back")
+        print("  to overall Glicko. That is a weaker model than this project is")
+        print("  designed around — a file with map results would be better.")
+    return matches
+
+
+_HLTV_REQUIRED = ("team1_name", "team2_name", "winner", "date")
+
+
+def _match_winner_name(raw: str, a: str, b: str) -> Optional[str]:
+    """
+    Work out which team a winner field refers to.
+
+    Datasets encode this as a team name, a side label, an index, or a flag,
+    with inconsistent case and spacing, so compare loosely rather than
+    demanding an exact string match.
+    """
+    v = str(raw).strip().lower()
+    if not v:
+        return None
+    if v in ("1", "team1", "team 1", "t1", "a", "team_1", "first"):
+        return a
+    if v in ("2", "team2", "team 2", "t2", "b", "team_2", "second"):
+        return b
+
+    def norm(x):
+        return " ".join(str(x).lower().split())
+
+    if v == norm(a):
+        return a
+    if v == norm(b):
+        return b
+    return None
+
+
+def _load_hltv_wide(path, headers, rows, verbose=True, set_pool=True) -> List[Match]:
+    """
+    The HLTV-scrape shape: one row per MATCH, wide, with player names.
+
+    Two things make this format worth special-casing:
+
+      1. It carries full lineups (team{N}_player_{1..5}_name), which is the
+         only real dataset here that can drive the roster-change mechanism.
+      2. Its map columns are labelled BY OUTCOME — winner_map / loser_map /
+         decider_map — not by team. That is a leakage trap: anything named
+         winner_* encodes the result. They are used ONLY to reconstruct which
+         maps were played and who won them, which is the label we learn from,
+         never as a pre-match feature.
+    """
+    from .data import set_active_pool as _set_pool
+
+    idx = {h.strip().lower(): i for i, h in enumerate(headers)}
+
+    def col(name, r, default=""):
+        i = idx.get(name)
+        if i is None or i >= len(r):
+            return default
+        return r[i].strip()
+
+    matches: List[Match] = []
+    skipped = Counter()
+    seen_maps = Counter()
+    # Examples per skip reason. The date fix only recorded examples for dates,
+    # so the very next failure — the winner column — was just as blind. Record
+    # them for every reason instead of learning this one column at a time.
+    examples: Dict[str, List[str]] = defaultdict(list)
+
+    def skip(reason: str, value: str = "") -> None:
+        skipped[reason] += 1
+        if value and len(examples[reason]) < 5:
+            examples[reason].append(value)
+
+    for r in rows:
+        d = _parse_date(col("date", r), dayfirst=False)
+        if d is None:
+            skip("unparseable date", col("date", r))
+            continue
+
+        a, b = col("team1_name", r), col("team2_name", r)
+        if not a or not b or a == b:
+            skip("missing or identical teams", f"{a!r} vs {b!r}")
+            continue
+
+        try:
+            s1, s2 = int(col("score_team1", r, "0")), int(col("score_team2", r, "0"))
+        except ValueError:
+            s1 = s2 = 0
+
+        # Prefer the SCORE. It is unambiguous, whereas the winner column can
+        # hold a team name, a side label ("team1"), a flag, or an index, and
+        # every dataset picks differently. The score needs no interpretation.
+        if s1 != s2:
+            winner = a if s1 > s2 else b
+        else:
+            winner = _match_winner_name(col("winner", r), a, b)
+            if winner is None:
+                skip("cannot determine winner", 
+                     f"winner={col('winner', r)!r} score={s1}-{s2}")
+                continue
+
+        loser = b if winner == a else a
+        top = max(s1, s2)
+        best_of = 1 if top <= 1 else (3 if top == 2 else 5)
+
+        # Reconstruct the maps. winner_map / loser_map say who took what; the
+        # decider is the last map of a split series, so the series winner took
+        # it. Anything that is not a recognised map name is dropped rather than
+        # guessed at.
+        # A decider only exists if the series was actually split. On a 2-0 the
+        # column may still be populated (the map that would have been played),
+        # and counting it would invent a game that never happened and hand its
+        # win to the favourite.
+        split = min(s1, s2) >= 1
+        sources = [("winner_map", winner), ("loser_map", loser)]
+        if split:
+            sources.append(("decider_map", winner))
+
+        results: List[MapResult] = []
+        for key, map_winner in sources:
+            name = _clean_map(col(key, r))
+            if not name or name.lower() in ("", "nan", "none", "tbd"):
+                continue
+            results.append(MapResult(
+                map_name=name,
+                winner=map_winner,
+                loser=loser if map_winner == winner else winner,
+            ))
+            seen_maps[name] += 1
+
+        if not results:
+            # No usable map detail on this row: keep the match, but as a single
+            # placeholder so the series still teaches the overall rating.
+            results = [MapResult(map_name="Match", winner=winner, loser=loser)]
+
+        def lineup(team_no):
+            names = [col(f"team{team_no}_player_{i}_name", r) for i in range(1, 6)]
+            names = [n for n in names if n and n.lower() not in ("nan", "none")]
+            return tuple(names)
+
+        event_type = col("event_type", r).lower()
+        # We know how many maps were played (the score says so). If we could
+        # not name them all, the record is partial and biased — flag it.
+        expected_maps = s1 + s2 if (s1 + s2) > 0 else len(results)
+        complete = len(results) == expected_maps and results[0].map_name != "Match"
+        if not complete:
+            skipped["partial map record (overall rating only)"] += 1
+
+        matches.append(Match(
+            team_a=a, team_b=b, date=d, best_of=best_of, maps=results,
+            winner=winner, maps_complete=complete,
+            lan="lan" in event_type or "offline" in event_type,
+            event=col("tournament", r),
+            lineup_a=lineup(1), lineup_b=lineup(2),
+        ))
+
+    if not matches:
+        # Show what was actually in the file. An error that hides the offending
+        # value forces a round trip to find out something the code already knew.
+        detail = f"no usable rows in {path}; skipped: {dict(skipped)}"
+        for reason, vals in examples.items():
+            detail += f"\n  {reason} — examples: {vals}"
+        raise ValueError(detail)
+
+    matches.sort(key=lambda m: m.date)
+
+    total_maps = sum(seen_maps.values())
+    pool = [m for m, c in seen_maps.most_common()
+            if total_maps and c / total_maps >= MIN_MAP_SHARE and m != "Match"]
+
+    if set_pool:
+        if len(pool) >= 7:
+            _set_pool(pool)
+        else:
+            _set_pool(["Match"], allow_degenerate=True)
+
+    if verbose:
+        teams = {t for m in matches for t in (m.team_a, m.team_b)}
+        with_lineups = sum(1 for m in matches if len(m.lineup_a) == 5)
+        bo = Counter(m.best_of for m in matches)
+        lan = sum(1 for m in matches if m.lan)
+        print(f"loaded {len(matches)} matches (HLTV wide format)")
+        print(f"  date range   {matches[0].date:%Y-%m-%d} to {matches[-1].date:%Y-%m-%d}")
+        print(f"  teams        {len(teams)}")
+        print(f"  formats      " + ", ".join(f"Bo{k}: {v}" for k, v in sorted(bo.items())))
+        print(f"  LAN matches  {lan}  ({lan / len(matches):.0%})")
+        print(f"  full 5-man lineups on {with_lineups} matches "
+              f"({with_lineups / len(matches):.0%}) — roster tracking active")
+        if len(pool) >= 7:
+            print(f"  map pool     {', '.join(pool)}")
+            print(f"  per-map results reconstructed for {total_maps} maps")
+        else:
+            print(f"  NOTE: only {len(pool)} distinct maps found, so per-map "
+                  f"ratings and the veto simulator are OFF.")
+        if skipped:
+            print(f"  skipped rows {dict(skipped)}")
+    return matches
+
+
 def _clean_map(name: str) -> str:
     n = str(name).strip().lower()
     n = re.sub(r"^(de|cs)[_\s]+", "", n)
     return n.title()
 
 
+_DATE_FORMATS = (
+    "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%m-%d-%Y", "%d.%m.%Y",
+    "%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y",
+    "%d %B, %Y", "%B %d, %Y", "%d %b, %Y", "%b %d, %Y",
+)
+
+
 def _parse_date(raw: str, dayfirst: bool) -> Optional[datetime]:
+    """
+    Public dumps write dates every way imaginable. Handles ISO, slash and dot
+    separated, textual months, and unix timestamps, and drops any time
+    component first.
+    """
     s = str(raw).strip()
-    if not s:
+    if not s or s.lower() in ("nan", "none", "null"):
         return None
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%m-%d-%Y"):
+
+    # Drop a time component: "2025-01-05T14:30:00" or "2025-01-05 14:30:00".
+    # Only when a colon is present, so "5 January 2025" survives intact.
+    s = s.replace("T", " ")
+    if ":" in s and " " in s:
+        s = s.split(" ")[0]
+    s = s.rstrip("Zz").strip()
+
+    # Unix timestamp, seconds or milliseconds.
+    if s.isdigit() and len(s) in (10, 13):
+        try:
+            return datetime.fromtimestamp(
+                int(s) / (1000.0 if len(s) == 13 else 1.0), tz=UTC
+            )
+        except (ValueError, OSError, OverflowError):
+            return None
+
+    for fmt in _DATE_FORMATS:
         try:
             return datetime.strptime(s, fmt).replace(tzinfo=UTC)
         except ValueError:
@@ -138,16 +428,38 @@ def load_csv_matches(
     if not rows:
         raise ValueError(f"{path} has no data rows")
 
+    lower = {h.strip().lower() for h in headers}
+    if all(c in lower for c in _HLTV_REQUIRED):
+        return _load_hltv_wide(path, headers, rows, verbose=verbose, set_pool=set_pool)
+
     i_date = (_find(headers, "date") or [None])[0]
     i_map = (_find(headers, "map") or [None])[0]
     score_cols = _find(headers, "pts", "score", "rounds")
     team_cols = _find(headers, "team", "visitor", "home", "opponent")
+    i_winner = (_find(headers, "winner", "result") or [None])[0]
 
-    if i_date is None or i_map is None or len(score_cols) < 2 or len(team_cols) < 2:
+    if i_date is None or len(team_cols) < 2:
         raise ValueError(
             f"could not identify columns in {path}.\n"
             f"  headers: {headers}\n"
-            f"  need a date, a map, two team columns and two score columns."
+            f"  need at least a date and two team columns."
+        )
+
+    # Two shapes exist in the wild. Per-map rows carry a map name and two
+    # scores; match-level rows only say who won. The second kind cannot feed
+    # the per-map ratings or the veto simulator, so it is loaded separately and
+    # flagged, rather than being bent into a shape it does not have.
+    if i_map is None or len(score_cols) < 2:
+        if i_winner is None:
+            raise ValueError(
+                f"could not identify columns in {path}.\n"
+                f"  headers: {headers}\n"
+                f"  need either (map + two scores) for per-map rows, or a "
+                f"winner column for match-level rows."
+            )
+        return _load_match_level(
+            path, headers, rows, i_date, team_cols[0], team_cols[1], i_winner,
+            verbose=verbose, set_pool=set_pool,
         )
 
     ta, tb = team_cols[0], team_cols[1]
