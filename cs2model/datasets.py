@@ -137,11 +137,14 @@ def _load_hltv_wide(path, headers, rows, verbose=True, set_pool=True) -> List[Ma
     matches: List[Match] = []
     skipped = Counter()
     seen_maps = Counter()
+    bad_dates: List[str] = []
 
     for r in rows:
         d = _parse_date(col("date", r), dayfirst=False)
         if d is None:
             skipped["unparseable date"] += 1
+            if len(bad_dates) < 5:
+                bad_dates.append(col("date", r))
             continue
 
         a, b = col("team1_name", r), col("team2_name", r)
@@ -211,7 +214,13 @@ def _load_hltv_wide(path, headers, rows, verbose=True, set_pool=True) -> List[Ma
         ))
 
     if not matches:
-        raise ValueError(f"no usable rows in {path}; skipped: {dict(skipped)}")
+        # Show what was actually in the file. An error that hides the offending
+        # value forces a round trip to find out something the code already knew.
+        detail = f"no usable rows in {path}; skipped: {dict(skipped)}"
+        if bad_dates:
+            detail += f"\n  example date values that would not parse: {bad_dates}"
+            detail += "\n  supported: ISO, d/m/y, m/d/y, textual months, unix timestamps"
+        raise ValueError(detail)
 
     matches.sort(key=lambda m: m.date)
 
@@ -254,11 +263,40 @@ def _clean_map(name: str) -> str:
     return n.title()
 
 
+_DATE_FORMATS = (
+    "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%m-%d-%Y", "%d.%m.%Y",
+    "%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y",
+    "%d %B, %Y", "%B %d, %Y", "%d %b, %Y", "%b %d, %Y",
+)
+
+
 def _parse_date(raw: str, dayfirst: bool) -> Optional[datetime]:
+    """
+    Public dumps write dates every way imaginable. Handles ISO, slash and dot
+    separated, textual months, and unix timestamps, and drops any time
+    component first.
+    """
     s = str(raw).strip()
-    if not s:
+    if not s or s.lower() in ("nan", "none", "null"):
         return None
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%m-%d-%Y"):
+
+    # Drop a time component: "2025-01-05T14:30:00" or "2025-01-05 14:30:00".
+    # Only when a colon is present, so "5 January 2025" survives intact.
+    s = s.replace("T", " ")
+    if ":" in s and " " in s:
+        s = s.split(" ")[0]
+    s = s.rstrip("Zz").strip()
+
+    # Unix timestamp, seconds or milliseconds.
+    if s.isdigit() and len(s) in (10, 13):
+        try:
+            return datetime.fromtimestamp(
+                int(s) / (1000.0 if len(s) == 13 else 1.0), tz=UTC
+            )
+        except (ValueError, OSError, OverflowError):
+            return None
+
+    for fmt in _DATE_FORMATS:
         try:
             return datetime.strptime(s, fmt).replace(tzinfo=UTC)
         except ValueError:
