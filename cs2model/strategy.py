@@ -30,6 +30,33 @@ from .tracker import Ledger
 UTC = timezone.utc
 
 
+def _filled_shares(resp, requested: float, dry_run: bool) -> float:
+    """
+    How many shares the venue says actually filled.
+
+    In dry run there is no book to fill against, so the requested size stands.
+    Live, we look for a matched size in the response and fall back to 0 rather
+    than to `requested` — assuming a fill we cannot see is precisely the error
+    that creates phantom positions.
+    """
+    if dry_run:
+        return requested
+    if not isinstance(resp, dict):
+        return 0.0
+    for key in ("size_matched", "sizeMatched", "matched_size", "filled_size"):
+        if key in resp:
+            try:
+                return float(resp[key])
+            except (TypeError, ValueError):
+                return 0.0
+    inner = resp.get("response")
+    if isinstance(inner, dict):
+        return _filled_shares(inner, requested, dry_run=False)
+    # A plain success acknowledgement with no size means the order rested on
+    # the book unfilled. Treat that as no position.
+    return 0.0
+
+
 @dataclass
 class Decision:
     market: MarketInfo
@@ -40,6 +67,7 @@ class Decision:
     edge: float = 0.0
     size_usd: float = 0.0
     shares: float = 0.0
+    series_key: str = ""
     taken: bool = False
     reason: str = ""
 
@@ -69,7 +97,17 @@ class Strategy:
         self.ledger = ledger
         self.venue = venue
         self.risk = risk
-        self._known = {normalise_team(t): t for t in book.teams}
+
+        # Collision-safe index. Two distinct teams can normalise to the same
+        # key ("Team Spirit" and "Spirit" both -> "spirit"); a plain dict
+        # comprehension silently keeps whichever came last, and the bot then
+        # prices a market off the WRONG team's ratings and buys it. Ambiguous
+        # keys are dropped and reported instead.
+        buckets: Dict[str, List[str]] = {}
+        for t in book.teams:
+            buckets.setdefault(normalise_team(t), []).append(t)
+        self._known = {k: v[0] for k, v in buckets.items() if len(v) == 1}
+        self._ambiguous = {k: v for k, v in buckets.items() if len(v) > 1}
 
     # ── team resolution ──────────────────────────────────────────────────────
 
@@ -85,6 +123,10 @@ class Strategy:
         if not name:
             return None
         return self._known.get(normalise_team(name))
+
+    def ambiguous_for(self, name: str) -> Optional[List[str]]:
+        """The candidates, when a name maps to more than one known team."""
+        return self._ambiguous.get(normalise_team(name)) if name else None
 
     # ── probability ──────────────────────────────────────────────────────────
 
@@ -123,10 +165,23 @@ class Strategy:
         ta, tb = self.resolve_team(m.team_a), self.resolve_team(m.team_b)
         if ta is None or tb is None:
             missing = m.team_a if ta is None else m.team_b
-            d.reason = f"unknown team {missing!r} — not in the match history"
+            clash = self.ambiguous_for(missing)
+            if clash:
+                d.reason = (f"ambiguous team {missing!r} — could be any of "
+                            f"{clash}; refusing to guess")
+            else:
+                d.reason = f"unknown team {missing!r} — not in the match history"
             return d
 
-        p_a = self.probability(ta, tb, map_name=m.map_name if m.market_kind == "map" else "")
+        # 4: honour the market's actual format. Forecasting a Bo1 as a Bo3
+        # inflates the favourite (longer series favour the better team), which
+        # manufactures an edge that is not there.
+        p_a = self.probability(
+            ta, tb,
+            best_of=m.best_of,
+            lan=m.lan,
+            map_name=m.map_name if m.market_kind == "map" else "",
+        )
 
         # Consider both sides; the value may be on the underdog.
         best: Optional[Tuple[float, float, str, str, BookTop]] = None
@@ -153,6 +208,17 @@ class Strategy:
         d.outcome_name, d.token_id = name, token_id
         d.model_prob, d.ask, d.edge = prob, top.best_ask, edge
 
+        # 8: the match market and every map market of the same series are one
+        # correlated bet. max_positions_per_market was declared but never read,
+        # so the bot could stack all of them.
+        series_key = f"{ta}|{tb}"
+        held = sum(1 for p in self.ledger.open_positions()
+                   if p.note.startswith(f"series:{series_key}"))
+        if held >= self.risk.limits.max_positions_per_market:
+            d.reason = (f"already holding {held} position(s) on this series "
+                        f"— they are the same bet")
+            return d
+
         verdict = self.risk.evaluate(
             self.ledger, model_prob=prob, price=top.best_ask,
             token_id=token_id, spread=top.spread, depth=top.ask_depth_usd,
@@ -171,6 +237,7 @@ class Strategy:
             return d
 
         d.size_usd, d.shares = cost, shares
+        d.series_key = series_key
         d.reason = verdict.reason
         d.taken = True
         return d
@@ -189,12 +256,27 @@ class Strategy:
             d = self.evaluate_market(m)
             if d.taken:
                 try:
-                    self.venue.buy(d.token_id, d.ask, d.shares)
+                    resp = self.venue.buy(d.token_id, d.ask, d.shares)
                 except Exception as e:
                     d.taken = False
                     d.reason = f"order failed: {e}"
                     decisions.append(d)
                     continue
+
+                # A LIMIT order may fill partially or not at all. Recording the
+                # requested size as though it filled creates phantom positions
+                # that consume the risk budget and corrupt every P&L number
+                # downstream. Trust the venue's reported fill.
+                filled = _filled_shares(resp, d.shares, dry_run=self.venue.dry_run)
+                if filled <= 0:
+                    d.taken = False
+                    d.reason = "order did not fill"
+                    decisions.append(d)
+                    continue
+                if filled < d.shares:
+                    d.reason += f" (partial fill {filled:,.1f}/{d.shares:,.1f})"
+                d.shares = filled
+                d.size_usd = filled * d.ask
 
                 self.ledger.open_position(
                     market=m.question,
@@ -205,9 +287,10 @@ class Strategy:
                     token_id=d.token_id,
                     market_kind=m.market_kind,
                     map_name=m.map_name,
+                    best_of=m.best_of,
                     event=m.slug,
                     dry_run=self.venue.dry_run,
-                    note=d.reason,
+                    note=f"series:{d.series_key} {d.reason}",
                 )
             decisions.append(d)
 

@@ -75,6 +75,8 @@ class MarketInfo:
     team_b: str = ""
     market_kind: str = "match"   # "match" | "map"
     map_name: str = ""
+    best_of: int = 3             # parsed from the question; drives the forecast
+    lan: bool = False
 
     def outcome_for(self, name: str) -> Optional[Outcome]:
         low = name.lower().strip()
@@ -112,6 +114,22 @@ class BookTop:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MAP_NAMES = ("Ancient", "Anubis", "Dust2", "Inferno", "Mirage", "Nuke", "Train")
+
+
+def parse_best_of(question: str) -> int:
+    """
+    Series length from the question text.
+
+    This matters more than it looks: a longer series favours the better team,
+    so forecasting a Bo1 as a Bo3 inflates the favourite and manufactures an
+    edge that does not exist. Defaults to Bo3, the most common format.
+    """
+    low = question.lower()
+    for token, bo in (("bo5", 5), ("best of 5", 5), ("bo3", 3),
+                      ("best of 3", 3), ("bo1", 1), ("best of 1", 1)):
+        if token in low:
+            return bo
+    return 3
 
 
 def parse_question(question: str) -> Tuple[str, str, str, str]:
@@ -273,6 +291,8 @@ class PolymarketVenue:
             team_b=b,
             market_kind=kind,
             map_name=map_name,
+            # A single map is exactly one game, whatever the series length.
+            best_of=1 if kind == "map" else parse_best_of(question),
         )
 
     # ── order book ───────────────────────────────────────────────────────────

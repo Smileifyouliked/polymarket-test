@@ -371,6 +371,14 @@ def cmd_run(args) -> int:
     else:
         print("DRY RUN — no orders will be sent. Add --live to trade for real.")
 
+    # A brand-new ledger with 0 capital halts instantly on "capital
+    # exhausted", which looks exactly like a crash. Fail loudly up front.
+    if not os.path.exists(args.ledger) and args.capital <= 0:
+        print(f"error: {args.ledger} does not exist and --capital was not set.\n"
+              f"       Start the bot with your bankroll, e.g. --capital 500",
+              file=sys.stderr)
+        return 2
+
     print(f"loading ratings and model from {args.data} ...")
     try:
         book, model = _load_engine(args)
@@ -409,10 +417,23 @@ def cmd_run(args) -> int:
                     print(d.line())
 
                 strat.mark_open_positions()
-                for line in strat.settle_resolved(markets):
-                    print(f"  settled  {line}")
 
-                led = Ledger(args.ledger)
+                # Settlement must look at CLOSED markets. The trading fetch
+                # asks for closed=False, so resolved markets never appeared
+                # there and settle_resolved() could never fire — positions
+                # accumulated forever, realised P&L stayed 0, and the
+                # daily-loss and drawdown halts could never trigger.
+                if led.open_positions():
+                    try:
+                        resolved = venue.fetch_markets(
+                            slug_contains=args.slug, limit=args.limit, closed=True
+                        )
+                        for line in strat.settle_resolved(resolved):
+                            print(f"  settled  {line}")
+                    except Exception as e:
+                        print(f"  settlement check failed: {e}")
+
+                led = Ledger(args.ledger, starting_capital=args.capital)
                 hb.beat(status="ok", note=render_compact(led, None))
                 print(f"{datetime.now(timezone.utc):%H:%M:%S}  "
                       f"{len(markets)} markets · {len(took)} taken · "

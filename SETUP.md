@@ -17,12 +17,15 @@ Part 4 is where you find out whether it was worth it.
 | Forecaster | built, tested | Rates teams per map, simulates the veto, outputs a calibrated probability |
 | Bankroll tracker | built, tested | Records positions, tracks capital, P&L, win rate, exposure |
 | Heartbeat + dashboard | built, tested | Tells you it's alive and whether you're up or down |
+| Polymarket bot | built, tested | Discovers markets, prices them, risk-checks, trades, settles |
+| Risk limits + kill switch | built, tested | Edge/exposure/loss caps; `cli stop` halts it instantly |
 | Real data ingest | **unverified** | Written but never run against the live API |
+| Polymarket calls | **unverified** | Written against the real client, but never sent |
 | Upcoming fixtures | **not built** | Can't yet tell you what's playing tomorrow |
-| Auto-settle | **not built** | You settle positions by hand for now |
 
-It is a **pre-match** forecaster. It does not watch rounds live, and it does
-not place bets — it records decisions you make so you can see if they were good.
+It is a **pre-match** forecaster. It does not watch rounds live. It runs in
+DRY RUN unless you pass `--live`, and the model has never been validated on a
+real CS2 match — Part 4 is where you find out whether it is worth anything.
 
 ---
 
@@ -106,7 +109,7 @@ sudo mkswap /swapfile && sudo swapon /swapfile
 python3 -m pytest tests/ -q
 ```
 
-✅ `44 passed`
+✅ `79 passed`
 
 ```bash
 python3 -m cs2model.cli demo
@@ -249,20 +252,27 @@ Use real odds from wherever you'd actually bet, but no real money, until you
 have **20+ settled bets**.
 
 ```bash
-# Open a position. Omit --stake for a capped-Kelly suggestion.
+# Open a position. Omit --shares for a capped-Kelly suggestion.
 python3 -m cs2model.cli bet --capital 500 \
-    --team-a "Vitality" --team-b "Spirit" --pick "Vitality" \
-    --prob 0.71 --odds 1.75 --bo 3 --event "IEM Cologne"
+    --market "Vitality vs Spirit" --outcome "Vitality" \
+    --prob 0.71 --price 0.58 --bo 3 --event "IEM Cologne"
+
+# Sportsbook odds instead of a Polymarket price:
+python3 -m cs2model.cli bet --market "Vitality vs Spirit" --outcome "Vitality" \
+    --prob 0.71 --odds 1.75 --stake 50
 
 # When the match finishes:
 python3 -m cs2model.cli settle --id a711dca5 --result won
+
+# Or sell out early, in full or in part:
+python3 -m cs2model.cli close --id a711dca5 --price 0.82
 
 # Look at everything:
 python3 -m cs2model.cli dashboard
 ```
 
-`--prob` is the model's probability **for the team you picked**. If `predict`
-says Vitality 71%, and you back Spirit, then `--prob` is `0.29`.
+`--prob` is the model's probability **for the outcome you bought**. If
+`predict` says Vitality 71% and you back Spirit, then `--prob` is `0.29`.
 
 ### The row that matters
 
@@ -283,8 +293,12 @@ Betting real money before this says `calibrated` is betting on an untested claim
 
 ```bash
 tmux new -s cs2
-python3 -m cs2model.cli run --interval 300
+python3 -m cs2model.cli run --capital 500 --interval 300
 ```
+
+`--capital` is required the first time — a ledger created with zero capital
+halts immediately on "capital exhausted", which looks exactly like a crash.
+The bot is in DRY RUN unless you add `--live`.
 
 Press **Ctrl+B** then **D** to detach. It keeps running with your laptop shut.
 Come back with `tmux attach -t cs2`.

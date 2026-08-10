@@ -219,3 +219,99 @@ def test_map_outside_the_active_pool_is_skipped(engine, tmp_path):
     d = strat.evaluate_market(m)
     assert not d.taken
     assert "not in the active pool" in d.reason
+
+
+# ── regressions from the second code review ──────────────────────────────────
+
+
+def test_colliding_team_names_are_refused_not_guessed(tmp_path):
+    """
+    "Team Spirit" and "Spirit" both normalise to "spirit". The index used to
+    keep whichever came last, so the bot priced the market off the WRONG
+    team's ratings and bought it.
+    """
+    from cs2model.data import generate_synthetic_league
+
+    matches = generate_synthetic_league(n_teams=6, n_matches=120, seed=31)
+    ds = build_dataset(matches)
+    model = CS2Model().fit(ds.X, ds.y)
+    book = RatingBook()
+    for m in sorted(matches, key=lambda x: x.date):
+        if m.winner and m.maps:
+            book.observe(m)
+
+    # Two distinct ids that collapse to the same normalised key.
+    book.team("Spirit").overall.r = 1900
+    book.team("Team Spirit").overall.r = 1200
+
+    led = Ledger(str(tmp_path / "l.json"), starting_capital=1000.0)
+    strat = Strategy(book, model, led, StubVenue(),
+                     RiskManager(RiskLimits(kill_switch_path=str(tmp_path / "S"))))
+
+    assert strat.resolve_team("Spirit") is None, "must not silently pick one"
+    assert set(strat.ambiguous_for("Spirit")) == {"Spirit", "Team Spirit"}
+
+    d = strat.evaluate_market(_market("Spirit", "Nobody"))
+    assert not d.taken
+    assert "ambiguous" in d.reason
+
+
+def test_bo1_is_not_forecast_as_bo3(engine, tmp_path):
+    """Longer series favour the better team, so mislabelling inflates the edge."""
+    _, _, teams = engine
+    a, b = teams[0], teams[-1]
+    strat, _ = _strategy(engine, tmp_path, StubVenue())
+    p1 = strat.probability(a, b, best_of=1)
+    p3 = strat.probability(a, b, best_of=3)
+    assert p1 != p3
+    assert p3 > p1, "the favourite should be stronger over more maps"
+
+
+def test_market_best_of_reaches_the_forecast(engine, tmp_path):
+    from cs2model.polymarket import parse_best_of
+
+    assert parse_best_of("Vitality vs Spirit (Bo1)") == 1
+    assert parse_best_of("Vitality vs Spirit - Best of 5") == 5
+    assert parse_best_of("Vitality vs Spirit") == 3
+
+    _, _, teams = engine
+    strat, _ = _strategy(engine, tmp_path, StubVenue())
+    m1 = _market(teams[0], teams[-1], question=f"{teams[0]} vs {teams[-1]} (Bo1)")
+    m1.best_of = 1
+    m3 = _market(teams[0], teams[-1])
+    assert strat.evaluate_market(m1).model_prob != strat.evaluate_market(m3).model_prob
+
+
+def test_unfilled_limit_order_creates_no_position(engine, tmp_path):
+    """
+    A resting limit order is not a position. Recording the requested size as
+    filled invents exposure that consumes the risk budget and corrupts P&L.
+    """
+    from cs2model.strategy import _filled_shares
+
+    assert _filled_shares({"status": "live"}, 100.0, dry_run=False) == 0.0
+    assert _filled_shares({"size_matched": "40"}, 100.0, dry_run=False) == 40.0
+    assert _filled_shares({"response": {"sizeMatched": 25}}, 100.0, dry_run=False) == 25.0
+    assert _filled_shares(None, 100.0, dry_run=False) == 0.0
+    # Dry run has no book to fill against, so the request stands.
+    assert _filled_shares({"status": "simulated"}, 100.0, dry_run=True) == 100.0
+
+
+def test_only_one_position_per_series(engine, tmp_path):
+    """The match market and its map markets are one correlated bet."""
+    _, _, teams = engine
+    a, b = teams[0], teams[-1]
+    strat0, _ = _strategy(engine, tmp_path, StubVenue())
+    p_a = strat0.probability(a, b)
+    tok = "tokA" if p_a >= 0.5 else "tokB"
+    price = round(max(p_a, 1 - p_a) - 0.20, 2)
+
+    venue = StubVenue({tok: BookTop(price - 0.01, price, 5000, 5000)})
+    strat, led = _strategy(engine, tmp_path, venue)
+
+    strat.run_once([_market(a, b, ta="t1", tb="t2")])
+    assert led.stats().open_count == 1
+
+    second = strat.evaluate_market(_market(a, b, ta="t3", tb="t4"))
+    assert not second.taken
+    assert "same bet" in second.reason
