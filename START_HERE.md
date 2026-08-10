@@ -123,7 +123,7 @@ computer.** Everything from here happens on the server.
 Copy and paste this whole line, then press Enter:
 
 ```
-sudo apt update && sudo apt install -y python3 python3-venv python3-pip git tmux
+sudo apt update && sudo apt install -y python3 python3-venv python3-pip git tmux unzip
 ```
 
 This installs Python (the language the program is written in) and a few
@@ -132,7 +132,7 @@ helpers. It takes a minute or two and prints a lot of text. That is normal.
 > If that gives an error saying `apt: command not found`, your server is a
 > different flavour of Linux. Use this instead:
 > ```
-> sudo dnf install -y python3 python3-pip git tmux
+> sudo dnf install -y python3 python3-pip git tmux unzip
 > ```
 
 Now check Python is there:
@@ -396,7 +396,7 @@ the proper test.
 | `kaggle: command not found` | You forgot `source venv/bin/activate` |
 | `Could not find kaggle.json` | Step 7.3 did not save. Try `cat ~/.kaggle/kaggle.json` to check |
 | `403 Forbidden` | The token is wrong, or you have not accepted the dataset's terms — open the dataset page in your browser once and click Download |
-| `unzip: command not found` | Run `sudo apt install -y unzip` |
+| `unzip: command not found` | Run `sudo apt install -y unzip`. Or unzip without installing anything: `python3 -c "import zipfile,glob; [zipfile.ZipFile(z).extractall('data/kaggle') for z in glob.glob('*.zip')]"` |
 | `could not identify columns` | Expected — that is why I need the header line first |
 
 ---
