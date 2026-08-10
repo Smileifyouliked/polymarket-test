@@ -146,6 +146,35 @@ python3 --version
 
 ---
 
+## Starting over from scratch
+
+If you installed an earlier version and want a completely clean slate, this is
+safe and takes one command.
+
+Everything the program installed lives inside a single folder called
+`polymarket-test`, including the Python sandbox. Deleting that folder removes
+all of it. Nothing else on your server is touched.
+
+```
+rm -rf ~/polymarket-test
+```
+
+Type it exactly. The `~/` means "my home folder", so it can only ever delete
+that one folder no matter where you are.
+
+Check it is gone:
+
+```
+ls ~
+```
+
+**You should see:** no `polymarket-test` in the list.
+
+**What you do NOT need to redo:** Step 3. Python, git and tmux stay installed
+on the server — they live outside the folder. Go straight to Step 4 below.
+
+---
+
 ## Step 4 — Download the program
 
 ```
