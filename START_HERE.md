@@ -85,9 +85,7 @@ Open a terminal on your own computer:
 - **Windows:** Start → type `powershell` → Enter
 - **Mac:** hold `Command`, press spacebar → type `terminal` → Enter
 
-Then type this, replacing the capitalised parts:
-
-Type this, but replace the two capitalised parts with your own details:
+Then type this, replacing the two capitalised parts with your own details:
 
 ```
 ssh -i /path/to/YOUR-KEY.pem ubuntu@YOUR-SERVER-IP
