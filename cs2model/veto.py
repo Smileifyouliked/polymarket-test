@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from .data import ACTIVE_DUTY, VETO_SCRIPTS, series_prob
+from .data import VETO_SCRIPTS, active_pool, series_prob
 
 # How rational the veto is. 0 -> perfectly greedy, higher -> sloppier.
 # Real vetoes are prep-driven and somewhat predictable, but not deterministic.
@@ -103,13 +103,14 @@ def simulate_veto(
     map_prob: Callable[[str], float],
     best_of: int,
     rng: random.Random,
-    pool: Sequence[str] = ACTIVE_DUTY,
+    pool: Optional[Sequence[str]] = None,
     temp: float = VETO_TEMPERATURE,
 ) -> List[Tuple[str, str]]:
     """
     One sampled veto. `map_prob(m)` is P(A wins map m).
     Returns the played maps in order, as (map_name, picked_by).
     """
+    pool = tuple(pool) if pool else active_pool()
     probs = [map_prob(m) for m in pool]
     pos, neg = _weight_tables(probs, temp)
     return [(pool[i], pb) for i, pb in _simulate_indices(pos, neg, best_of, rng)]
@@ -120,7 +121,7 @@ def match_win_prob(
     best_of: int,
     n_sims: int = 600,
     seed: int = 0,
-    pool: Sequence[str] = ACTIVE_DUTY,
+    pool: Optional[Sequence[str]] = None,
     pick_advantage: float = 0.02,
     temp: float = VETO_TEMPERATURE,
 ) -> float:
@@ -131,6 +132,7 @@ def match_win_prob(
     maps they have prepped, and the raw rating does not fully capture that.
     Small on purpose; it is a real but modest effect.
     """
+    pool = tuple(pool) if pool else active_pool()
     probs = [map_prob(m) for m in pool]
     pos, neg = _weight_tables(probs, temp)
 
@@ -159,11 +161,12 @@ def veto_report(
     best_of: int,
     n_sims: int = 2000,
     seed: int = 0,
-    pool: Sequence[str] = ACTIVE_DUTY,
+    pool: Optional[Sequence[str]] = None,
     temp: float = VETO_TEMPERATURE,
 ) -> Dict[str, float]:
     """How often each map actually reaches the server. Useful for sanity checks
     and for explaining a prediction to a human."""
+    pool = tuple(pool) if pool else active_pool()
     probs = [map_prob(m) for m in pool]
     pos, neg = _weight_tables(probs, temp)
     rng = random.Random(seed)

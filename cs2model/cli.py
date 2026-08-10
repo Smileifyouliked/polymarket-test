@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from .data import ACTIVE_DUTY, Match, generate_synthetic_league, load_matches, save_matches
+from .data import Match, active_pool, generate_synthetic_league, load_matches, save_matches
 from .evaluate import report, walk_forward
 from .model import CS2Model, build_dataset
 from .ratings import RatingBook
@@ -99,6 +99,18 @@ def cmd_ingest(args) -> int:
     return 0
 
 
+def cmd_load_csv(args) -> int:
+    """Convert a public CSV of match results into the model's format."""
+    from .datasets import load_csv_matches
+
+    matches = load_csv_matches(args.csv)
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    save_matches(matches, args.out)
+    print(f"\nwrote {len(matches)} series -> {args.out}")
+    print(f"now run: python -m cs2model.cli evaluate --data {args.out}")
+    return 0
+
+
 def cmd_evaluate(args) -> int:
     matches = load_matches(args.data)
     print(f"loaded {len(matches)} matches from {args.data}")
@@ -151,7 +163,7 @@ def cmd_predict(args) -> int:
     print(f"  P({args.team_a} wins) = {p:.1%}")
     print()
     print("  per-map probabilities (before the veto):")
-    for m in ACTIVE_DUTY:
+    for m in active_pool():
         mp = map_prob(m)
         bar = "#" * int(round(mp * 30))
         print(f"    {m:<10} {mp:5.1%}  {bar}")
@@ -371,6 +383,14 @@ def cmd_run(args) -> int:
     else:
         print("DRY RUN — no orders will be sent. Add --live to trade for real.")
 
+    # A brand-new ledger with 0 capital halts instantly on "capital
+    # exhausted", which looks exactly like a crash. Fail loudly up front.
+    if not os.path.exists(args.ledger) and args.capital <= 0:
+        print(f"error: {args.ledger} does not exist and --capital was not set.\n"
+              f"       Start the bot with your bankroll, e.g. --capital 500",
+              file=sys.stderr)
+        return 2
+
     print(f"loading ratings and model from {args.data} ...")
     try:
         book, model = _load_engine(args)
@@ -409,10 +429,23 @@ def cmd_run(args) -> int:
                     print(d.line())
 
                 strat.mark_open_positions()
-                for line in strat.settle_resolved(markets):
-                    print(f"  settled  {line}")
 
-                led = Ledger(args.ledger)
+                # Settlement must look at CLOSED markets. The trading fetch
+                # asks for closed=False, so resolved markets never appeared
+                # there and settle_resolved() could never fire — positions
+                # accumulated forever, realised P&L stayed 0, and the
+                # daily-loss and drawdown halts could never trigger.
+                if led.open_positions():
+                    try:
+                        resolved = venue.fetch_markets(
+                            slug_contains=args.slug, limit=args.limit, closed=True
+                        )
+                        for line in strat.settle_resolved(resolved):
+                            print(f"  settled  {line}")
+                    except Exception as e:
+                        print(f"  settlement check failed: {e}")
+
+                led = Ledger(args.ledger, starting_capital=args.capital)
                 hb.beat(status="ok", note=render_compact(led, None))
                 print(f"{datetime.now(timezone.utc):%H:%M:%S}  "
                       f"{len(markets)} markets · {len(took)} taken · "
@@ -459,6 +492,11 @@ def main(argv=None) -> int:
     i.add_argument("--pages", type=int, default=20)
     i.add_argument("--per-page", type=int, default=100)
     i.set_defaults(func=cmd_ingest)
+
+    lc = sub.add_parser("load-csv", help="import real results from a CSV file")
+    lc.add_argument("--csv", required=True, help="path to the downloaded CSV")
+    lc.add_argument("--out", default="data/matches.json")
+    lc.set_defaults(func=cmd_load_csv)
 
     v = sub.add_parser("evaluate", help="walk-forward evaluation on saved matches")
     v.add_argument("--data", default="data/matches.json")
