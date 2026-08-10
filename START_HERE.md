@@ -25,26 +25,67 @@ real money for a long time. I will tell you clearly when that changes.
 
 ---
 
-## Step 1 — Open a terminal on your own computer
+## Step 1 — Know what a terminal is
 
 A **terminal** is a window where you type commands instead of clicking
-buttons. It looks like a black or white box with text.
-
-**On Windows:** Click Start. Type the word `powershell`. Press Enter.
-
-**On Mac:** Hold the `Command` key and press the spacebar. Type the word
-`terminal`. Press Enter.
-
-**You should see:** a window with some text and a blinking cursor.
-
-That is it. That is the whole step.
+buttons. It looks like a black or white box with text. You will get one in
+the next step.
 
 ---
 
 ## Step 2 — Connect to your server
 
 Your server is a computer that lives in a data centre and is always on. You
-control it by typing commands into your terminal.
+control it by typing commands into it.
+
+There are **two ways** to connect. Pick one.
+
+### Way A — the browser button (easier, no key file needed)
+
+1. Log in to AWS in your web browser.
+2. Search for **EC2**, click **Instances**, tick your server.
+3. Check it says **Running** and **2/2 checks passed**. If it says
+   "Initializing", wait 2 minutes — it is still switching on.
+4. Click the **Connect** button at the top.
+5. Choose the **EC2 Instance Connect** tab, then click **Connect**.
+
+A black terminal window opens inside your browser. That is your server.
+
+> #### If you see "Failed to connect to your instance"
+>
+> This almost always means your security group is not letting AWS in. The
+> browser button connects **from an AWS server, not from your computer**, so a
+> rule that says "My IP" will block it.
+>
+> Fix it like this:
+> 1. EC2 → **Instances** → tick your server → **Security** tab
+> 2. Click the blue security group link (starts with `sg-`)
+> 3. **Inbound rules** → **Edit inbound rules** → **Add rule**
+> 4. Type: **SSH**
+> 5. Source: choose **Custom**, and in the box type the address for your
+>    region:
+>
+>    | Your region (shown top-right in AWS) | Type this in the box |
+>    |---|---|
+>    | Europe (Ireland) `eu-west-1` | `18.202.216.48/29` |
+>    | Europe (Frankfurt) `eu-central-1` | `3.120.181.40/29` |
+>    | Europe (Stockholm) `eu-north-1` | `13.48.4.200/30` |
+>
+>    Other region? Type `com.amazonaws.` then your region then
+>    `.ec2-instance-connect` and pick the entry that appears.
+> 6. **Save rules**, wait 30 seconds, try Connect again.
+>
+> Leave your existing "My IP" rule alone — it does no harm and you need it for
+> Way B.
+
+### Way B — from your own terminal (needs the `.pem` key file)
+
+Open a terminal on your own computer:
+
+- **Windows:** Start → type `powershell` → Enter
+- **Mac:** hold `Command`, press spacebar → type `terminal` → Enter
+
+Then type this, replacing the capitalised parts:
 
 Type this, but replace the two capitalised parts with your own details:
 
