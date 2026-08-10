@@ -174,38 +174,96 @@ def cmd_predict(args) -> int:
     return 0
 
 
+def _load_engine(args):
+    """Rebuild ratings + model from the match history on disk."""
+    matches = load_matches(args.data)
+    ds = build_dataset(matches)
+    model = CS2Model().fit(ds.X, ds.y)
+    book = RatingBook()
+    for m in sorted(matches, key=lambda x: x.date):
+        if m.winner and m.maps:
+            book.observe(m)
+    return book, model
+
+
+def _risk_from_args(args):
+    from .risk import RiskLimits, RiskManager
+
+    return RiskManager(RiskLimits(
+        min_edge=args.min_edge,
+        min_confidence=args.min_confidence,
+        kelly_cap=args.kelly_cap,
+        max_position_pct=args.max_position_pct,
+        max_total_exposure_pct=args.max_exposure_pct,
+        max_open_positions=args.max_positions,
+        daily_loss_limit_pct=args.daily_loss_pct,
+        max_spread=args.max_spread,
+        min_book_depth=args.min_depth,
+        kill_switch_path=args.kill_switch,
+    ))
+
+
+def cmd_markets(args) -> int:
+    from .polymarket import PolymarketVenue
+
+    venue = PolymarketVenue(dry_run=True)
+    try:
+        markets = venue.fetch_markets(slug_contains=args.slug, limit=args.limit)
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    print(f"{len(markets)} markets\n")
+    for m in markets:
+        parsed = (f"{m.team_a} vs {m.team_b}" if m.team_a else "UNPARSED")
+        kind = f"{m.map_name} map" if m.market_kind == "map" else "match"
+        prices = "/".join(f"{o.name[:10]} {o.price:.2f}" for o in m.outcomes[:2])
+        print(f"  {m.question[:56]:<56} [{kind:<10}] {parsed[:30]:<30} {prices}")
+    if args.raw:
+        os.makedirs(os.path.dirname(args.raw) or ".", exist_ok=True)
+        with open(args.raw, "w") as f:
+            json.dump([m.__dict__ for m in markets], f, indent=2, default=str)
+        print(f"\nsaved -> {args.raw}")
+    return 0
+
+
 def cmd_bet(args) -> int:
+    """Manual position entry. The bot does this itself; this is for overrides."""
     from .tracker import Ledger, kelly_fraction
 
     led = Ledger(args.ledger, starting_capital=args.capital)
     if not led.positions and args.capital > 0:
         led.starting_capital = args.capital
 
-    stake = args.stake
-    if stake is None:
-        # No stake given: suggest capped Kelly rather than making one up.
+    price, shares = args.price, args.shares
+    if args.odds and args.stake:
+        price, shares = 0.0, 0.0
+    if price and not shares:
         avail = led.stats().capital
-        frac = kelly_fraction(args.prob, args.odds, cap=args.kelly_cap)
-        stake = round(avail * frac, 2)
-        print(f"no --stake given; {args.kelly_cap:.0%} Kelly on {avail:,.2f} "
-              f"suggests {stake:,.2f}")
-        if stake <= 0:
-            print("Kelly says do not take this bet — the edge is negative.",
-                  file=sys.stderr)
+        frac = kelly_fraction(args.prob, price, cap=args.kelly_cap)
+        cost = round(avail * frac, 2)
+        if cost <= 0:
+            print("Kelly says no: the price is at or above the model's "
+                  "probability, so there is no edge.", file=sys.stderr)
             return 1
+        shares = round(cost / price, 2)
+        print(f"no --shares given; {args.kelly_cap:.0%} Kelly suggests "
+              f"{shares:,.2f} shares (${cost:,.2f})")
 
     try:
         p = led.open_position(
-            team_a=args.team_a, team_b=args.team_b, pick=args.pick,
-            model_prob=args.prob, odds=args.odds, stake=stake,
-            best_of=args.bo, event=args.event, note=args.note,
+            market=args.market, outcome=args.outcome, model_prob=args.prob,
+            price=price or 0.0, shares=shares or 0.0,
+            odds=args.odds or 0.0, stake=args.stake or 0.0,
+            market_kind="map" if args.map else "match", map_name=args.map,
+            best_of=args.bo, event=args.event, note=args.note, dry_run=True,
         )
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    print(f"opened {p.id}: {p.pick} @ {p.odds:.2f} for {p.stake:,.2f} "
-          f"(to win {p.to_win:,.2f}, edge {p.edge:+.1%})")
+    print(f"opened {p.id}: {p.outcome} — {p.shares:,.2f} shares @ {p.price:.3f} "
+          f"= ${p.cost:,.2f} (to win ${p.to_win:,.2f}, edge {p.edge:+.1%})")
     return 0
 
 
@@ -223,6 +281,40 @@ def cmd_settle(args) -> int:
     return 0
 
 
+def cmd_close(args) -> int:
+    from .tracker import Ledger
+
+    led = Ledger(args.ledger)
+    try:
+        p = led.close(args.id, args.price, shares=args.shares)
+    except (KeyError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    print(f"closed {p.shares:,.2f} shares of {p.outcome} at {p.exit_price:.3f}: "
+          f"P&L {p.pnl:+,.2f} — capital now {led.stats().capital:,.2f}")
+    return 0
+
+
+def cmd_stop(args) -> int:
+    from .risk import engage_kill_switch
+
+    engage_kill_switch(args.kill_switch, reason=args.reason)
+    print(f"KILL SWITCH ENGAGED -> {args.kill_switch}")
+    print("The bot will place no further orders. Open positions are untouched.")
+    print(f"Resume with: python -m cs2model.cli resume")
+    return 0
+
+
+def cmd_resume(args) -> int:
+    from .risk import release_kill_switch
+
+    if release_kill_switch(args.kill_switch):
+        print("kill switch released — the bot may trade again")
+    else:
+        print("kill switch was not engaged")
+    return 0
+
+
 def cmd_dashboard(args) -> int:
     from .dashboard import render, render_compact
     from .tracker import Heartbeat, Ledger
@@ -231,16 +323,18 @@ def cmd_dashboard(args) -> int:
 
     def once() -> str:
         led = Ledger(args.ledger, starting_capital=args.capital)
-        return render_compact(led, hb) if args.compact else render(led, hb)
+        if args.compact:
+            return render_compact(led, hb)
+        from .risk import RiskLimits, RiskManager
+        rm = RiskManager(RiskLimits(kill_switch_path=args.kill_switch))
+        stop, why = rm.halted(led)
+        return render(led, hb, mode=args.mode, risk_note=why if stop else "")
 
     if not args.watch:
         print(once())
         return 0
-
     try:
         while True:
-            # Re-read from disk each tick so a running `run` loop or another
-            # SSH session settling a bet shows up here immediately.
             os.system("clear" if os.name != "nt" else "cls")
             print(once())
             print(f"\n  refreshing every {args.watch}s — Ctrl+C to exit")
@@ -251,36 +345,87 @@ def cmd_dashboard(args) -> int:
 
 def cmd_run(args) -> int:
     """
-    The long-running process. Beats, then does its periodic work.
+    The bot. Discover -> price -> risk -> trade -> mark -> settle, on a loop.
 
-    Keep it in tmux on a server so it survives your SSH session dropping:
-        tmux new -s cs2
-        python -m cs2model.cli run
-        Ctrl+B then D to detach
+    DRY RUN UNLESS --live IS PASSED. Dry run does everything except sign the
+    order, so you can watch exactly what it would have done, for as long as
+    you like, before any money is involved.
     """
+    from .dashboard import render_compact
+    from .polymarket import PolymarketVenue
+    from .strategy import Strategy
     from .tracker import Heartbeat, Ledger
 
-    hb = Heartbeat(args.heartbeat, stale_after=max(args.interval * 3, 60))
-    print(f"starting run loop: heartbeat -> {args.heartbeat} every {args.interval}s")
-    print("Ctrl+C to stop")
+    risk = _risk_from_args(args)
+    venue = PolymarketVenue(dry_run=not args.live)
+    hb = Heartbeat(args.heartbeat, stale_after=max(args.interval * 3, 120))
+
+    if args.live:
+        print("=" * 66)
+        print("  LIVE TRADING — REAL MONEY")
+        print("=" * 66)
+        if not os.getenv("POLYMARKET_PRIVATE_KEY"):
+            print("POLYMARKET_PRIVATE_KEY is not set; cannot sign orders.",
+                  file=sys.stderr)
+            return 2
+    else:
+        print("DRY RUN — no orders will be sent. Add --live to trade for real.")
+
+    print(f"loading ratings and model from {args.data} ...")
+    try:
+        book, model = _load_engine(args)
+    except FileNotFoundError:
+        print(f"error: {args.data} not found. Run `ingest` first.", file=sys.stderr)
+        return 2
+    print(f"  {len(book.teams)} teams known")
+    print(f"heartbeat -> {args.heartbeat} every {args.interval}s · Ctrl+C to stop")
+    print(f"kill switch: touch {args.kill_switch}\n")
 
     try:
         while True:
             led = Ledger(args.ledger, starting_capital=args.capital)
-            s = led.stats()
-            note = (f"capital {s.capital:,.2f} · {s.open_count} open · "
-                    f"{s.wins}W-{s.losses}L")
-            hb.beat(status="ok", note=note)
-            print(f"{datetime.now(timezone.utc):%H:%M:%S}  beat · {note}")
+            strat = Strategy(book, model, led, venue, risk)
+
+            stop, why = risk.halted(led)
+            if stop:
+                hb.beat(status="halted", note=why)
+                print(f"{datetime.now(timezone.utc):%H:%M:%S}  HALTED — {why}")
+            else:
+                try:
+                    markets = venue.fetch_markets(slug_contains=args.slug,
+                                                  limit=args.limit)
+                except Exception as e:
+                    hb.beat(status="degraded", note=f"market fetch failed: {e}")
+                    print(f"{datetime.now(timezone.utc):%H:%M:%S}  "
+                          f"market fetch failed: {e}")
+                    if args.once:
+                        return 1
+                    time.sleep(args.interval)
+                    continue
+
+                decisions = strat.run_once(markets)
+                took = [d for d in decisions if d.taken]
+                for d in decisions if args.verbose else took:
+                    print(d.line())
+
+                strat.mark_open_positions()
+                for line in strat.settle_resolved(markets):
+                    print(f"  settled  {line}")
+
+                led = Ledger(args.ledger)
+                hb.beat(status="ok", note=render_compact(led, None))
+                print(f"{datetime.now(timezone.utc):%H:%M:%S}  "
+                      f"{len(markets)} markets · {len(took)} taken · "
+                      f"{render_compact(led, None)}")
 
             if args.once:
                 return 0
             time.sleep(args.interval)
     except KeyboardInterrupt:
         hb.beat(status="stopped", note="stopped by operator")
-        print("\nstopped cleanly — heartbeat marked as stopped")
+        print("\nstopped cleanly")
         return 0
-    except Exception as e:  # keep the loop's death visible in the heartbeat
+    except Exception as e:
         hb.beat(status="crashed", note=f"{type(e).__name__}: {e}")
         raise
 
@@ -332,48 +477,93 @@ def main(argv=None) -> int:
                    help="below this confidence the model declines to call it")
     p.set_defaults(func=cmd_predict)
 
-    # ── tracking ─────────────────────────────────────────────────────────────
+    # ── tracking & trading ───────────────────────────────────────────────────
     def _ledger_args(sp):
         sp.add_argument("--ledger", default="data/ledger.json")
         sp.add_argument("--capital", type=float, default=0.0,
                         help="starting bankroll; only used when creating a new ledger")
+        sp.add_argument("--kill-switch", default="data/STOP")
 
-    b = sub.add_parser("bet", help="record a position you are taking")
+    def _risk_args(sp):
+        sp.add_argument("--min-edge", type=float, default=0.05)
+        sp.add_argument("--min-confidence", type=float, default=0.60)
+        sp.add_argument("--kelly-cap", type=float, default=0.25)
+        sp.add_argument("--max-position-pct", type=float, default=0.05)
+        sp.add_argument("--max-exposure-pct", type=float, default=0.30)
+        sp.add_argument("--max-positions", type=int, default=10)
+        sp.add_argument("--daily-loss-pct", type=float, default=0.10)
+        sp.add_argument("--max-spread", type=float, default=0.04)
+        sp.add_argument("--min-depth", type=float, default=50.0)
+
+    mk = sub.add_parser("markets", help="list CS2 markets on Polymarket")
+    mk.add_argument("--slug", default="cs2")
+    mk.add_argument("--limit", type=int, default=100)
+    mk.add_argument("--raw", default="", help="save parsed markets to this file")
+    mk.set_defaults(func=cmd_markets)
+
+    b = sub.add_parser("bet", help="record a position by hand")
     _ledger_args(b)
-    b.add_argument("--team-a", required=True)
-    b.add_argument("--team-b", required=True)
-    b.add_argument("--pick", required=True, help="which team you are backing")
+    b.add_argument("--market", required=True, help='e.g. "Vitality vs Spirit"')
+    b.add_argument("--outcome", required=True, help="the side you bought")
     b.add_argument("--prob", type=float, required=True,
-                   help="model probability for your PICK (0-1)")
-    b.add_argument("--odds", type=float, required=True, help="decimal odds, e.g. 1.85")
-    b.add_argument("--stake", type=float, default=None,
-                   help="omit to get a capped-Kelly suggestion")
+                   help="model probability for that side (0-1)")
+    b.add_argument("--price", type=float, default=0.0, help="Polymarket price 0-1")
+    b.add_argument("--shares", type=float, default=0.0,
+                   help="omit for a capped-Kelly suggestion")
+    b.add_argument("--odds", type=float, default=0.0, help="sportsbook decimal odds")
+    b.add_argument("--stake", type=float, default=0.0, help="sportsbook stake")
     b.add_argument("--kelly-cap", type=float, default=0.25)
+    b.add_argument("--map", default="", help="map name for a map market")
     b.add_argument("--bo", type=int, default=3, choices=[1, 3, 5])
     b.add_argument("--event", default="")
     b.add_argument("--note", default="")
     b.set_defaults(func=cmd_bet)
 
-    st = sub.add_parser("settle", help="resolve an open position")
-    _ledger_args(st)
-    st.add_argument("--id", required=True)
-    st.add_argument("--result", required=True, choices=["won", "lost", "void"])
-    st.set_defaults(func=cmd_settle)
+    stl = sub.add_parser("settle", help="resolve a position at 1 or 0")
+    _ledger_args(stl)
+    stl.add_argument("--id", required=True)
+    stl.add_argument("--result", required=True, choices=["won", "lost", "void"])
+    stl.set_defaults(func=cmd_settle)
 
-    db = sub.add_parser("dashboard", help="capital, P&L, open positions, health")
+    cl = sub.add_parser("close", help="sell before resolution (full or partial)")
+    _ledger_args(cl)
+    cl.add_argument("--id", required=True)
+    cl.add_argument("--price", type=float, required=True, help="exit price 0-1")
+    cl.add_argument("--shares", type=float, default=None,
+                    help="omit to close the whole position")
+    cl.set_defaults(func=cmd_close)
+
+    sp_stop = sub.add_parser("stop", help="engage the kill switch")
+    sp_stop.add_argument("--kill-switch", default="data/STOP")
+    sp_stop.add_argument("--reason", default="manual stop")
+    sp_stop.set_defaults(func=cmd_stop)
+
+    sp_res = sub.add_parser("resume", help="release the kill switch")
+    sp_res.add_argument("--kill-switch", default="data/STOP")
+    sp_res.set_defaults(func=cmd_resume)
+
+    db = sub.add_parser("dashboard", help="capital, P&L, positions, health")
     _ledger_args(db)
     db.add_argument("--heartbeat", default="data/heartbeat.json")
-    db.add_argument("--stale-after", type=float, default=180.0)
-    db.add_argument("--watch", type=float, default=0.0,
-                    metavar="SECONDS", help="refresh continuously")
-    db.add_argument("--compact", action="store_true", help="single-line output")
+    db.add_argument("--stale-after", type=float, default=600.0)
+    db.add_argument("--watch", type=float, default=0.0, metavar="SECONDS")
+    db.add_argument("--compact", action="store_true")
+    db.add_argument("--mode", default="")
     db.set_defaults(func=cmd_dashboard)
 
-    rn = sub.add_parser("run", help="long-running loop that emits the heartbeat")
+    rn = sub.add_parser("run", help="the bot: discover, price, risk, trade")
     _ledger_args(rn)
+    _risk_args(rn)
+    rn.add_argument("--data", default="data/matches.json")
     rn.add_argument("--heartbeat", default="data/heartbeat.json")
-    rn.add_argument("--interval", type=float, default=60.0)
-    rn.add_argument("--once", action="store_true", help="single beat then exit")
+    rn.add_argument("--interval", type=float, default=300.0)
+    rn.add_argument("--slug", default="cs2")
+    rn.add_argument("--limit", type=int, default=100)
+    rn.add_argument("--once", action="store_true", help="one pass then exit")
+    rn.add_argument("--verbose", action="store_true",
+                    help="show skipped markets and why")
+    rn.add_argument("--live", action="store_true",
+                    help="REAL MONEY. Without this it is a dry run.")
     rn.set_defaults(func=cmd_run)
 
     args = ap.parse_args(argv)

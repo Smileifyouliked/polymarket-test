@@ -53,6 +53,8 @@ def render(
     ledger: Ledger,
     heartbeat: Optional[Heartbeat] = None,
     width: Optional[int] = None,
+    mode: str = "",
+    risk_note: str = "",
 ) -> str:
     w = width or min(shutil.get_terminal_size((88, 24)).columns, 100)
     s = ledger.stats()
@@ -61,6 +63,14 @@ def render(
     out.append("")
     out.append(bold("  CS2 MODEL — BANKROLL & STATUS"))
     out.append("  " + _rule(w - 2))
+
+    if mode:
+        badge = green("  DRY RUN  ") if "DRY" in mode.upper() else red("  ● LIVE  ")
+        out.append(f"  {badge} {dim(mode)}")
+    if risk_note:
+        out.append(f"  {red('HALTED')} {risk_note}")
+    if mode or risk_note:
+        out.append("  " + _rule(w - 2))
 
     # ── is it alive ──────────────────────────────────────────────────────────
     if heartbeat is not None:
@@ -93,6 +103,11 @@ def render(
            else red("▼") if s.capital < s.starting_capital else dim("="))
     )
     out.append(f"    realised P&L    {money(s.realised_pnl, 12, sign=True)}")
+    out.append(f"    unrealised      {money(s.unrealised_pnl, 12, sign=True)}   "
+               + dim("(open positions marked at the bid)"))
+    out.append(f"    equity          {money(s.equity, 12)}   "
+               + dim("(realised + unrealised — your real number)"))
+    out.append(f"    P&L today       {money(s.pnl_today, 12, sign=True)}")
     out.append(f"    peak            {money(s.peak_capital, 12)}")
     dd = f"    drawdown        {money(-s.drawdown, 12, sign=True)}"
     if s.drawdown > 0:
@@ -113,19 +128,20 @@ def render(
             f"({s.exposure_pct:.1f}% of capital)"
         )
         out.append("")
-        out.append(dim(f"    {'id':<9}{'matchup':<34}{'pick':<16}{'stake':>9}{'to win':>10}"))
+        out.append(dim(f"    {'id':<9}{'market':<38}{'shares':>9}{'cost':>9}{'now':>8}{'P&L':>10}"))
         for p in ledger.open_positions():
-            matchup = f"{p.team_a} vs {p.team_b}"
-            if len(matchup) > 32:
-                matchup = matchup[:31] + "…"
-            pick = p.pick if len(p.pick) <= 14 else p.pick[:13] + "…"
+            label = p.market if len(p.market) <= 36 else p.market[:35] + "…"
+            mark = ledger.mark_for(p)
+            unreal = p.unrealised_at(mark)
             out.append(
-                f"    {p.id:<9}{matchup:<34}{pick:<16}"
-                f"{p.stake:>9,.2f}{p.to_win:>10,.2f}"
+                f"    {p.id:<9}{label:<38}{p.shares:>9,.1f}{p.cost:>9,.2f}"
+                f"{mark:>8.2f}{money(unreal, 10, sign=True)}"
             )
+            kind = f"{p.map_name} map" if p.market_kind == "map" else f"Bo{p.best_of}"
+            flag = dim(" [paper]") if p.dry_run else ""
             out.append(
-                dim(f"    {'':<9}Bo{p.best_of}  model {p.model_prob:.0%} vs "
-                    f"market {p.implied_prob:.0%}  edge {p.edge:+.1%}  @ {p.odds:.2f}")
+                dim(f"    {'':<9}{p.outcome[:16]:<16} {kind}  entry {p.price:.2f}  "
+                    f"model {p.model_prob:.0%}  edge {p.edge:+.1%}") + flag
             )
     out.append("")
 
@@ -137,6 +153,7 @@ def render(
         out.append(
             f"    {green(str(s.wins) + 'W')} · {red(str(s.losses) + 'L')}"
             + (f" · {dim(str(s.voids) + ' void')}" if s.voids else "")
+            + (f" · {dim(str(s.closed_early) + ' closed early')}" if s.closed_early else "")
             + f"    win rate {s.win_rate:.1%}"
         )
         out.append(f"    {_bar(s.win_rate)}  {s.wins}/{s.wins + s.losses}")
@@ -183,8 +200,9 @@ def render_compact(ledger: Ledger, heartbeat: Optional[Heartbeat] = None) -> str
     s = ledger.stats()
     alive = "?" if heartbeat is None else ("up" if heartbeat.is_alive() else "DOWN")
     return (
-        f"[{alive}] capital {s.capital:,.2f} "
-        f"pnl {s.realised_pnl:+,.2f} "
+        f"[{alive}] equity {s.equity:,.2f} "
+        f"realised {s.realised_pnl:+,.2f} unreal {s.unrealised_pnl:+,.2f} "
+        f"today {s.pnl_today:+,.2f} "
         f"{s.wins}W-{s.losses}L ({s.win_rate:.0%}) "
         f"open {s.open_count} (risk {s.at_risk:,.2f})"
     )
