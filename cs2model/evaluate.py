@@ -297,8 +297,24 @@ def report(res: WalkForwardResult, true_p: Optional[np.ndarray] = None) -> str:
             f"{row['coverage']:>8.1%}  {row['n']:>8d}"
         )
     lines.append("")
-    lines.append("  Read it like this: at confidence 0.75 the model is right ~75% of the")
-    lines.append("  time on the matches it agrees to call, and it declines the rest.")
+    # Whether accuracy actually rises with confidence is a PROPERTY OF THE
+    # MODEL, not a guarantee. On real CS2 data this curve inverted — 65% at
+    # the 0.65 bar, 44% at 0.80 — so a fixed sentence promising "0.75 means
+    # ~75%" was printing a falsehood directly beneath a table disproving it.
+    rows = [r for r in coverage_curve(res.y, res.p_model) if r["n"] >= 30]
+    if len(rows) >= 2:
+        best = max(rows, key=lambda r: r["accuracy"])
+        rising = rows[-1]["accuracy"] >= rows[0]["accuracy"]
+        if rising:
+            lines.append("  Accuracy rises as the bar rises, so raising your confidence")
+            lines.append("  threshold buys accuracy at the cost of coverage. That is the trade.")
+        else:
+            lines.append("  WARNING: accuracy does NOT rise with confidence on this data — the")
+            lines.append("  curve peaks and then falls. Raising the bar makes the model WORSE,")
+            lines.append("  which means the abstention mechanism is broken. Do not bet on the")
+            lines.append("  high-confidence calls; they are the least reliable ones here.")
+        lines.append(f"  Best observed: {best['accuracy']:.1%} at confidence "
+                     f"{best['threshold']:.2f}, covering {best['coverage']:.0%} of matches.")
     lines.append("")
 
     lines.append("-" * 78)
